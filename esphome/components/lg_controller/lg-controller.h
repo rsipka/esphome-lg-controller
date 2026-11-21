@@ -198,6 +198,8 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
 
     enum class PendingSendKind : uint8_t { None, Status, TypeA, TypeB, TypeBRequest };
     PendingSendKind pending_send_ = PendingSendKind::None;
+    enum class SendSlot : uint8_t { Status, TypeA, TypeB };
+    SendSlot next_send_slot_ = SendSlot::Status;
 
     bool pending_status_change_ = false;
     bool pending_status_refresh_ = false;
@@ -206,6 +208,7 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     bool pending_type_b_request_ = false;
     bool overheating_change_pending_ = false;
     bool overheating_change_sent_ = false;
+    optional<uint32_t> overheating_echo_millis_{};
     // Type A field bits: vane positions 0–3, fan speeds 4–7, Auto Dry 8.
     static constexpr uint16_t TYPE_A_AUTO_DRY = 1U << 8;
     static constexpr size_t TYPE_A_FIELD_COUNT = 9;
@@ -220,7 +223,6 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     static constexpr uint32_t CAPABILITIES_TIMEOUT_MS = 15000;
     optional<uint32_t> initial_settings_request_millis_{};
     bool slave_status_synced_ = false;
-    bool prefer_status_send_ = true;
     enum StartupStatusField : uint8_t {
         STARTUP_MODE = 1U << 0,
         STARTUP_TARGET = 1U << 1,
@@ -599,6 +601,9 @@ public:
             set_swing_mode(*call.get_swing_mode());
             fields |= STARTUP_SWING;
         }
+        if (fields == 0) {
+            return;
+        }
         queue_status_change(fields);
         ESP_LOGD(TAG, "Queued climate command");
         this->publish_state();
@@ -772,7 +777,7 @@ private:
             return;
         }
 
-        if (overheating_ == value) {
+        if (last_recv_type_b_settings_[0] != 0 && overheating_ == value) {
             return;
         }
 
@@ -1156,11 +1161,14 @@ private:
         send_buf_[4] = fan_speed_[2];
         send_buf_[5] = fan_speed_[3];
 
-        // Bytes 7-8 store vane positions.
-        send_buf_[7] = (send_buf_[7] & 0xf0) | (vane_position_[0] & 0x0f); // Set vane 1
-        send_buf_[7] = (send_buf_[7] & 0x0f) | ((vane_position_[1] & 0x0f) << 4); // Set vane 2
-        send_buf_[8] = (send_buf_[8] & 0xf0) | (vane_position_[2] & 0x0f); // Set vane 3
-        send_buf_[8] = (send_buf_[8] & 0x0f) | ((vane_position_[3] & 0x0f) << 4); // Set vane 4
+        // Bytes 7-8 store vane positions. Keep unrecognized slots unless changed locally.
+        for (size_t i = 0; i < 4; ++i) {
+            uint8_t& packed = send_buf_[7 + i / 2];
+            uint8_t shift = (i % 2) * 4;
+            if (((packed >> shift) & 0x0F) <= 6 || is_type_a_field_pending(1U << i)) {
+                packed = (packed & ~(0x0F << shift)) | (vane_position_[i] << shift);
+            }
+        }
 
         // Set auto dry setting.
         uint8_t b = send_buf_[11] & ~0x8;
@@ -1198,8 +1206,11 @@ private:
             send_buf_[1] |= 0x80;
         } else {
             send_buf_[1] &= ~0x80;
-            // Byte 2 stores installer setting 15.
-            send_buf_[2] = (send_buf_[2] & 0xC7) | (overheating_ << 3);
+            // Byte 2 stores installer setting 15. Preserve unrecognized values unless changed locally.
+            if (((send_buf_[2] >> 3) & 0x07) <= 4 || overheating_change_pending_ ||
+                overheating_echo_millis_.has_value()) {
+                send_buf_[2] = (send_buf_[2] & 0xC7) | (overheating_ << 3);
+            }
         }
 
         send_buf_[12] = calc_checksum(send_buf_);
@@ -1290,6 +1301,10 @@ private:
                 }
                 sent_type_a_fields_ = 0;
             } else if (pending_send_ == PendingSendKind::TypeB) {
+                if (overheating_change_sent_) {
+                    overheating_echo_millis_ = millis();
+                    ESP_LOGD(TAG, "Type B transmit echoed, waiting for unit readback");
+                }
                 overheating_change_sent_ = false;
             }
             pending_send_ = PendingSendKind::None;
@@ -1533,7 +1548,7 @@ private:
                 // Apply new traits automatically only during initial synchronization without queued commands.
                 if (first_capabilities && is_initializing_ &&
                     pending_type_a_fields_ == 0 && sent_type_a_fields_ == 0 && awaiting_type_a_fields_ == 0 &&
-                    !overheating_change_pending_ && !overheating_change_sent_ &&
+                    !overheating_change_pending_ && !overheating_change_sent_ && !overheating_echo_millis_.has_value() &&
                     !sleep_timer_command_pending_ && !sleep_timer_cancel_pending_ &&
                     !sleep_timer_target_millis_.has_value()) {
                     ESP_LOGD(TAG, "restarting to apply initial capabilities");
@@ -1623,9 +1638,13 @@ private:
         }
 
         uint8_t overheating = (buffer[2] >> 3) & 0b111;
+        if (overheating_echo_millis_.has_value() && overheating_ == overheating) {
+            overheating_echo_millis_.reset();
+            ESP_LOGD(TAG, "Unit confirmed Type B settings");
+        }
         if (overheating > 4) {
             ESP_LOGE(TAG, "Unexpected overheating value: %u", overheating);
-        } else if (!overheating_change_pending_ && !overheating_change_sent_) {
+        } else if (!overheating_change_pending_ && !overheating_change_sent_ && !overheating_echo_millis_.has_value()) {
             overheating_ = overheating;
             overheating_select_.publish_state(*overheating_select_.at(overheating));
         }
@@ -1721,6 +1740,11 @@ private:
                 awaiting_type_a_fields_ &= ~expired_fields;
                 ESP_LOGD(TAG, "Timed out waiting for Type A readback (fields 0x%03X)", unsigned(expired_fields));
             }
+        }
+        if (overheating_echo_millis_.has_value() &&
+            millis() - *overheating_echo_millis_ >= SETTINGS_READBACK_TIMEOUT_MS) {
+            overheating_echo_millis_.reset();
+            ESP_LOGD(TAG, "Timed out waiting for Type B readback");
         }
         read_received_messages();
 
@@ -1821,42 +1845,42 @@ private:
 
         bool type_a_due = pending_type_a_settings_change_ &&
                           (last_recv_type_a_settings_[0] == 0xCA || last_recv_type_a_settings_[0] == 0xAA);
-        bool type_b_due = pending_type_b_settings_change_ && last_recv_type_b_settings_[0] != 0;
+        bool type_b_ready = last_recv_type_b_settings_[0] != 0;
+        bool type_b_write_due = pending_type_b_settings_change_ && type_b_ready;
+        bool type_b_request_due = !slave_ && type_b_ready &&
+                                  (pending_type_b_request_ || millis_now - last_sent_recv_type_b_millis_ > 10 * 60 * 1000);
         bool status_change_due = pending_status_change_ || (!is_initializing_ && sleep_timer_command_pending_);
         bool status_due = status_change_due ||
                           (!slave_ && (pending_status_refresh_ || millis_now - last_sent_status_millis_ > 20 * 1000));
-        // Alternate status and settings when both are queued, including settings retries.
-        if (status_due && (prefer_status_send_ || (!type_a_due && !type_b_due))) {
-            if (check_can_send()) {
-                pending_status_change_ = status_change_due;
-                send_status_message();
-                prefer_status_send_ = false;
-                // Some units reset the vane position after changing swing or operation mode.
-                if (status_change_due) {
-                    pending_type_a_settings_change_ = true;
-                }
+        const bool due[] = {status_due, type_a_due, type_b_write_due || type_b_request_due};
+        const size_t slot_count = std::size(due);
+        // A retry takes another turn in the rotation instead of holding up the other frame types.
+        for (size_t offset = 0; offset < slot_count; ++offset) {
+            size_t slot = (static_cast<size_t>(next_send_slot_) + offset) % slot_count;
+            if (!due[slot]) {
+                continue;
             }
+            if (!check_can_send()) {
+                return;
+            }
+            switch (static_cast<SendSlot>(slot)) {
+                case SendSlot::Status:
+                    pending_status_change_ = status_change_due;
+                    send_status_message();
+                    // Some units reset the vane position after changing swing or operation mode.
+                    if (status_change_due) {
+                        pending_type_a_settings_change_ = true;
+                    }
+                    break;
+                case SendSlot::TypeA:
+                    send_type_a_settings_message();
+                    break;
+                case SendSlot::TypeB:
+                    send_type_b_settings_message(/* timed = */ !type_b_write_due);
+                    break;
+            }
+            next_send_slot_ = static_cast<SendSlot>((slot + 1) % slot_count);
             return;
-        }
-        if (type_a_due) {
-            if (check_can_send()) {
-                send_type_a_settings_message();
-                prefer_status_send_ = true;
-            }
-            return;
-        }
-        if (type_b_due) {
-            if (check_can_send()) {
-                send_type_b_settings_message(/* timed = */ false);
-                prefer_status_send_ = true;
-            }
-            return;
-        }
-        // Send an AB message every 10 minutes to request pipe temperature values.
-        if (!slave_ && (pending_type_b_request_ || millis_now - last_sent_recv_type_b_millis_ > 10 * 60 * 1000)) {
-            if (check_can_send()) {
-                send_type_b_settings_message(/* timed = */ true);
-            }
         }
     }
 };
