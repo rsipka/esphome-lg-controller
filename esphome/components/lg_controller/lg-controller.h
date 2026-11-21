@@ -207,10 +207,11 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     bool overheating_change_sent_ = false;
     // Type A field bits: vane positions 0–3, fan speeds 4–7, Auto Dry 8.
     static constexpr uint16_t TYPE_A_AUTO_DRY = 1U << 8;
+    static constexpr size_t TYPE_A_FIELD_COUNT = 9;
     uint16_t pending_type_a_fields_ = 0;
     uint16_t sent_type_a_fields_ = 0;
     uint16_t awaiting_type_a_fields_ = 0;
-    uint32_t type_a_echo_millis_ = 0;
+    uint32_t type_a_echo_millis_[TYPE_A_FIELD_COUNT] = {};
     bool publishing_type_a_settings_ = false;
     static constexpr uint32_t SETTINGS_READBACK_TIMEOUT_MS = 15000;
 
@@ -232,6 +233,7 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
 
     optional<uint32_t> sleep_timer_target_millis_{};
     optional<uint32_t> sleep_timer_start_millis_{};
+    bool sleep_timer_command_pending_ = false;
     optional<uint32_t> last_peer_sleep_command_minutes_{};
     static constexpr uint8_t SLEEP_TIMER_KIND = 3;
     bool sleep_timer_cancel_pending_ = false;
@@ -715,11 +717,9 @@ private:
             return false;
         }
         ESP_LOGD(TAG, "Setting sleep timer: %d minutes", minutes);
+        sleep_timer_command_pending_ = true;
         sleep_timer_cancel_pending_ = minutes == 0;
         sleep_timer_start_millis_.reset();
-        if (minutes > 0) {
-            sleep_timer_start_millis_ = millis();
-        }
         apply_sleep_timer(minutes);
         return true;
     }
@@ -779,6 +779,10 @@ private:
     }
 
     void sync_sleep_timer(MessageSender sender, const uint8_t* buffer) {
+        // Startup status frames can be sent before the queued timer command is encoded.
+        if (sleep_timer_command_pending_) {
+            return;
+        }
         bool reservation_active = buffer[3] & 0x10;
         uint8_t kind = (buffer[8] >> 3) & 0x7;
         uint32_t minutes = (uint32_t(buffer[8] & 0x7) << 8) | buffer[9];
@@ -972,18 +976,15 @@ private:
         if (fahrenheit_) {
             target = TempConversion::celsius_to_lgcelsius(target);
         }
-        if (target < MIN_TEMP_SETPOINT) {
-            target = MIN_TEMP_SETPOINT;
-        } else if (target > MAX_TEMP_SETPOINT) {
-            target = MAX_TEMP_SETPOINT;
+        if (std::isnan(target)) {
+            target = 20.0f;
         }
+        target = std::clamp(target, float(MIN_TEMP_SETPOINT), float(MAX_TEMP_SETPOINT));
+        uint8_t target_half_degrees = uint8_t(std::lround(target * 2));
 
         // Byte 5. Unchanged except for the low bit which indicates the target temperature has a
         // 0.5 fractional part.
-        send_buf_[5] = last_recv_status_[5] & ~0x1;
-        if (target - uint8_t(target) == 0.5) {
-            send_buf_[5] |= 0x1;
-        }
+        send_buf_[5] = (last_recv_status_[5] & ~0x1) | (target_half_degrees & 1);
 
         // Preserve ceiling height in byte 6 and the heating/cooling flags in byte 7.
         uint8_t thermistor_bits = last_recv_status_[6] & 0x30;
@@ -999,7 +1000,7 @@ private:
             thermistor_bits = !internal_thermistor_.state && external_temperature.has_value() ? 0x10 : 0;
             room_temperature_bits = uint8_t((external_temperature.value_or(20.0f) - 10) * 2);
         }
-        send_buf_[6] = (last_recv_status_[6] & 0xC0) | thermistor_bits | ((uint8_t(target) - 15) & 0x0F);
+        send_buf_[6] = (last_recv_status_[6] & 0xC0) | thermistor_bits | ((target_half_degrees / 2 - 15) & 0x0F);
         send_buf_[7] = (last_recv_status_[7] & 0xC0) | room_temperature_bits;
 
         // Bytes 8-10. Initialize bytes 8-9 to 0 to not echo back timer settings set by the AC.
@@ -1015,18 +1016,20 @@ private:
                 send_buf_[9] |= 0x40;
             }
             send_buf_[10] = 0x80;
-        } else if (sleep_timer_cancel_pending_) {
-            // A sleep-timer message with zero minutes cancels that reservation.
-            send_buf_[8] = SLEEP_TIMER_KIND << 3;
-        } else if (optional<uint32_t> minutes = get_sleep_timer_minutes()) {
-            // Set sleep timer.
+        } else if (optional<uint32_t> minutes = sleep_timer_cancel_pending_
+                                                   ? optional<uint32_t>{0}
+                                                   : get_sleep_timer_minutes()) {
+            // Zero minutes cancels the sleep timer.
             // Byte 8 stores the kind (0x38) and high bits of number of minutes (0x7).
             // Byte 9 stores the low bits of the number of minutes.
             send_buf_[8] = SLEEP_TIMER_KIND << 3;
             send_buf_[8] |= (*minutes >> 8) & 0b111;
             send_buf_[9] = *minutes & 0xff;
-            if (pending_status_change_ && sleep_timer_start_millis_.has_value()) {
-                sleep_timer_start_millis_ = millis();
+            if (sleep_timer_command_pending_) {
+                sleep_timer_command_pending_ = false;
+                if (*minutes > 0) {
+                    sleep_timer_start_millis_ = millis();
+                }
             }
         }
 
@@ -1195,7 +1198,12 @@ private:
             if (pending_send_ == PendingSendKind::TypeA) {
                 if (sent_type_a_fields_ != 0) {
                     awaiting_type_a_fields_ |= sent_type_a_fields_;
-                    type_a_echo_millis_ = millis();
+                    uint32_t now = millis();
+                    for (size_t i = 0; i < TYPE_A_FIELD_COUNT; ++i) {
+                        if (sent_type_a_fields_ & (1U << i)) {
+                            type_a_echo_millis_[i] = now;
+                        }
+                    }
                     ESP_LOGD(TAG, "Type A transmit echoed, waiting for unit readback");
                 }
                 sent_type_a_fields_ = 0;
@@ -1426,8 +1434,9 @@ private:
             ESPPreferenceObject pref = global_preferences->make_preference<NVSStorage>(this->get_object_id_hash() ^ NVS_STORAGE_VERSION);
             if (pref.save(&updated) && global_preferences->sync()) {
                 nvs_storage_ = updated;
-                // Only reboot automatically for the first saved capabilities.
-                if (first_capabilities) {
+                // Avoid interrupting a sleep timer to apply newly discovered capabilities.
+                if (first_capabilities && !sleep_timer_command_pending_ && !sleep_timer_cancel_pending_ &&
+                    !sleep_timer_target_millis_.has_value()) {
                     ESP_LOGD(TAG, "restarting to apply initial capabilities");
                     App.safe_reboot();
                 } else {
@@ -1600,9 +1609,19 @@ private:
     }
 
     void update() {
-        if (awaiting_type_a_fields_ != 0 && millis() - type_a_echo_millis_ >= SETTINGS_READBACK_TIMEOUT_MS) {
-            ESP_LOGD(TAG, "Timed out waiting for Type A readback (fields 0x%03X)", unsigned(awaiting_type_a_fields_));
-            awaiting_type_a_fields_ = 0;
+        if (awaiting_type_a_fields_ != 0) {
+            uint16_t expired_fields = 0;
+            uint32_t now = millis();
+            for (size_t i = 0; i < TYPE_A_FIELD_COUNT; ++i) {
+                uint16_t field = 1U << i;
+                if ((awaiting_type_a_fields_ & field) && now - type_a_echo_millis_[i] >= SETTINGS_READBACK_TIMEOUT_MS) {
+                    expired_fields |= field;
+                }
+            }
+            if (expired_fields != 0) {
+                awaiting_type_a_fields_ &= ~expired_fields;
+                ESP_LOGD(TAG, "Timed out waiting for Type A readback (fields 0x%03X)", unsigned(expired_fields));
+            }
         }
         read_received_messages();
 
@@ -1615,6 +1634,9 @@ private:
             switch (pending_send_) {
                 case PendingSendKind::Status:
                     pending_status_change_ = true;
+                    if (((send_buf_[8] >> 3) & 0x7) == SLEEP_TIMER_KIND && sleep_timer_start_millis_.has_value()) {
+                        sleep_timer_command_pending_ = true;
+                    }
                     break;
                 case PendingSendKind::TypeA:
                     pending_type_a_fields_ |= sent_type_a_fields_;
@@ -1650,6 +1672,7 @@ private:
                 ESP_LOGD(TAG, "Turning off for sleep timer");
                 apply_sleep_timer(0);
                 sleep_timer_start_millis_.reset();
+                sleep_timer_command_pending_ = true;
                 sleep_timer_cancel_pending_ = true;
                 publish_sleep_timer(0);
                 this->mode = climate::CLIMATE_MODE_OFF;
@@ -1710,8 +1733,9 @@ private:
         // Additionally, queue a Type A message after sending the status message because some
         // units set the vane position to the default setting after changing swing mode or
         // operation mode.
-        if (pending_status_change_) {
+        if (pending_status_change_ || (!is_initializing_ && sleep_timer_command_pending_)) {
             if (check_can_send()) {
+                pending_status_change_ = true;
                 send_status_message();
                 pending_type_a_settings_change_ = true;
             }
