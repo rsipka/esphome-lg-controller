@@ -3,6 +3,11 @@
 #include "esphome.h"
 #include "esphome/components/uart/uart.h"
 
+// ESPHome 2026.11 stopped exposing format_hex_pretty through helpers.h.
+#if __has_include("esphome/core/alloc_helpers.h")
+#include "esphome/core/alloc_helpers.h"
+#endif
+
 static const char* const TAG = "lg-controller";
 
 namespace esphome::lg_controller {
