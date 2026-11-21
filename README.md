@@ -107,6 +107,7 @@ If you just want to connect to the device to view the debug logs, use `esphome l
 Features currently available in Home Assistant:
 * Operation mode (off, auto, cool, heat, dry/dehumidify, fan only).
 * Current HVAC action inferred from the indoor unit's status, including idle, heating, cooling, and defrosting.
+* LG Jet/Power fan speed appears as Focus in Home Assistant on units that advertise Power support.
 * Target temperature (0.5°C steps).
 * Use of a Home Assistant temperature sensor for room temperature (rounded to nearest 0.5°C). 
 * Fan speed (slow, low, medium, high, auto).

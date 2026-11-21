@@ -229,6 +229,7 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
         FAN_MEDIUM,
         FAN_MEDIUM_HIGH,
         FAN_HIGH,
+        FAN_POWER,
         MODE_HEATING,
         MODE_FAN,
         MODE_AUTO,
@@ -253,6 +254,8 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
                 return (nvs_storage_.capabilities_message[6] & 0x10) != 0;
             case LgCapability::FAN_HIGH:
                 return true;
+            case LgCapability::FAN_POWER:
+                return (nvs_storage_.capabilities_message[3] & 0x02) != 0;
             case LgCapability::MODE_HEATING:
                 return (nvs_storage_.capabilities_message[2] & 0x40) != 0;
             case LgCapability::MODE_FAN:
@@ -284,6 +287,7 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
         fan_modes.insert(climate::CLIMATE_FAN_MEDIUM);
         fan_modes.insert(climate::CLIMATE_FAN_HIGH);
         fan_modes.insert(climate::CLIMATE_FAN_AUTO);
+        fan_modes.insert(climate::CLIMATE_FAN_FOCUS);
         
         climate::ClimateSwingModeMask swing_modes;
         swing_modes.insert(climate::CLIMATE_SWING_OFF);
@@ -328,6 +332,8 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
                 override_fan_modes.insert(climate::CLIMATE_FAN_MEDIUM);
             if (parse_capability(LgCapability::FAN_HIGH))
                 override_fan_modes.insert(climate::CLIMATE_FAN_HIGH);
+            if (parse_capability(LgCapability::FAN_POWER))
+                override_fan_modes.insert(climate::CLIMATE_FAN_FOCUS);
             supported_traits_.set_supported_fan_modes(override_fan_modes);
 
             climate::ClimateSwingModeMask override_swing_modes;
@@ -457,6 +463,9 @@ public:
         ESPPreferenceObject pref = global_preferences->make_preference<NVSStorage>(this->get_object_id_hash() ^ NVS_STORAGE_VERSION);
         pref.load(&nvs_storage_);
 
+        // ESPHome restores fan and swing modes only if the traits already advertise them.
+        configure_capabilities();
+
         auto restore = this->restore_state_();
         if (restore.has_value()) {
             restore->apply(this);
@@ -471,9 +480,6 @@ public:
         internal_thermistor_.restore_and_set_mode(esphome::switch_::SWITCH_RESTORE_DEFAULT_OFF);
 
         sleep_timer_.publish_state(0);
-
-        // Configure climate traits and entities based on the capabilities message (if available)
-        configure_capabilities();
 
         while (UARTDevice::available() > 0) {
             uint8_t b;
@@ -694,7 +700,7 @@ private:
         // Byte 0: message type.
         send_buf_[0] = slave_ ? 0x28 : 0xA8;
 
-        // Byte 1: changed flag (0x1), power on (0x2), mode (0x1C), fan speed (0x70).
+        // Byte 1: changed flag (0x1), power on (0x2), mode (0x1C), fan speed (0xE0).
         uint8_t b = 0;
         if (pending_status_change_) {
             b |= 0x1;
@@ -742,6 +748,9 @@ private:
                     break;
                 case climate::CLIMATE_FAN_QUIET:
                     b |= 4 << 5;
+                    break;
+                case climate::CLIMATE_FAN_FOCUS:
+                    b |= 7 << 5;
                     break;
                 default:
                     ESP_LOGE(TAG, "unknown fan mode, using Medium");
@@ -1138,6 +1147,9 @@ private:
                 break;
             case 4:
                 this->fan_mode = climate::CLIMATE_FAN_QUIET;
+                break;
+            case 7:
+                this->fan_mode = climate::CLIMATE_FAN_FOCUS;
                 break;
             default:
                 ESP_LOGE(TAG, "received unexpected fan mode from AC (%u)", fan_val);
