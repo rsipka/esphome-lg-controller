@@ -207,6 +207,7 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     optional<uint32_t> sleep_timer_target_millis_{};
     bool active_reservation_ = false;
     bool ignore_sleep_timer_callback_ = false;
+    bool ignore_switch_callbacks_ = false;
 
     uint32_t NVS_STORAGE_VERSION = 2843654U; // Change version if the NVSStorage struct changes
     struct NVSStorage {
@@ -440,17 +441,25 @@ public:
             set_fan_speed(3, v);
         });
         sleep_timer_.add_on_state_callback([this](float v) {
-            set_sleep_timer(v);
+            if (!ignore_sleep_timer_callback_ && set_sleep_timer(v)) {
+                pending_status_change_ = true;
+            }
         });
 
         purifier_.add_on_state_callback([this](bool) {
-            pending_status_change_ = true;
+            if (!ignore_switch_callbacks_) {
+                pending_status_change_ = true;
+            }
         });
         internal_thermistor_.add_on_state_callback([this](bool) {
-            pending_status_change_ = true;
+            if (!ignore_switch_callbacks_) {
+                pending_status_change_ = true;
+            }
         });
         auto_dry_.add_on_state_callback([this](bool) {
-            pending_type_a_settings_change_ = true;
+            if (!ignore_switch_callbacks_) {
+                pending_type_a_settings_change_ = true;
+            }
         });
     }
 
@@ -477,15 +486,19 @@ public:
             this->publish_state();
         }
 
+        ignore_switch_callbacks_ = true;
         internal_thermistor_.restore_and_set_mode(esphome::switch_::SWITCH_RESTORE_DEFAULT_OFF);
-
-        sleep_timer_.publish_state(0);
+        ignore_switch_callbacks_ = false;
+        publish_sleep_timer(0);
 
         while (UARTDevice::available() > 0) {
             uint8_t b;
             UARTDevice::read_byte(&b);
         }
-        pending_status_change_ = true;
+        // The master sends its restored state and requests settings. The slave listens first.
+        if (!slave_) {
+            pending_status_change_ = true;
+        }
 
         // Call `update` every 6 seconds, but first wait 10 seconds.
         set_timeout("initial_send", 10000, [this]() {
@@ -624,14 +637,11 @@ private:
         }
     }
 
-    void set_sleep_timer(int minutes) {
-        if (ignore_sleep_timer_callback_) {
-            return;
-        }
+    bool set_sleep_timer(int minutes) {
         // 0 clears the timer. Accept max 7 hours.
         if (minutes < 0 || minutes > 7 * 60) {
             ESP_LOGE(TAG, "Ignoring invalid sleep timer value: %d minutes", minutes);
-            return;
+            return false;
         }
         ESP_LOGD(TAG, "Setting sleep timer: %d minutes", minutes);
         if (minutes > 0) {
@@ -641,7 +651,19 @@ private:
             sleep_timer_target_millis_.reset();
             active_reservation_ = false;
         }
-        pending_status_change_ = true;
+        return true;
+    }
+
+    void publish_sleep_timer(uint32_t minutes) {
+        ignore_sleep_timer_callback_ = true;
+        sleep_timer_.publish_state(minutes);
+        ignore_sleep_timer_callback_ = false;
+    }
+
+    void publish_switch_state(LgSwitch& entity, bool state) {
+        ignore_switch_callbacks_ = true;
+        entity.publish_state(state);
+        ignore_switch_callbacks_ = false;
     }
 
     optional<float> get_room_temp() const {
@@ -1190,18 +1212,22 @@ private:
                 return;
         }
 
-        purifier_.publish_state(buffer[2] & 0x4);
+        publish_switch_state(purifier_, buffer[2] & 0x4);
 
         bool horiz_swing = buffer[2] & 0x40;
         bool vert_swing = buffer[2] & 0x80;
+        climate::ClimateSwingMode reported_swing = climate::CLIMATE_SWING_OFF;
         if (horiz_swing && vert_swing) {
-            set_swing_mode(climate::CLIMATE_SWING_BOTH);
+            reported_swing = climate::CLIMATE_SWING_BOTH;
         } else if (horiz_swing) {
-            set_swing_mode(climate::CLIMATE_SWING_HORIZONTAL);
+            reported_swing = climate::CLIMATE_SWING_HORIZONTAL;
         } else if (vert_swing) {
-            set_swing_mode(climate::CLIMATE_SWING_VERTICAL);
+            reported_swing = climate::CLIMATE_SWING_VERTICAL;
+        }
+        if (slave_) {
+            this->swing_mode = reported_swing;
         } else {
-            set_swing_mode(climate::CLIMATE_SWING_OFF);
+            set_swing_mode(reported_swing);
         }
 
         float target = float((buffer[6] & 0xf) + 15);
@@ -1215,12 +1241,20 @@ private:
 
         active_reservation_ = buffer[3] & 0x10;
 
-        // Set or clear sleep timer.
-        if (sleep_timer_target_millis_.has_value() && !active_reservation_) {
-            sleep_timer_.publish_state(0);
-        } else if (((buffer[8] >> 3) & 0x7) == 3) {
+        // A slave mirrors a bus timer without taking ownership of its countdown.
+        if (((buffer[8] >> 3) & 0x7) == 3) {
             uint32_t minutes = (uint32_t(buffer[8] & 0x7) << 8) | buffer[9];
-            sleep_timer_.publish_state(minutes);
+            if (minutes <= 7 * 60) {
+                if (!slave_ || minutes == 0) {
+                    set_sleep_timer(minutes);
+                }
+                publish_sleep_timer(minutes);
+            }
+        } else if (!active_reservation_) {
+            sleep_timer_target_millis_.reset();
+            if (sleep_timer_.state > 0) {
+                publish_sleep_timer(0);
+            }
         }
 
         publish_state();
@@ -1261,11 +1295,11 @@ private:
     }
 
     void process_type_a_settings_message(MessageSender sender, const uint8_t* buffer) {
-        // Send settings the first time we receive a 0xCA message.
+        // The master sends settings after the first 0xCA message.
         if (sender != MessageSender::Slave) {
             bool first_time = last_recv_type_a_settings_[0] == 0;
             memcpy(last_recv_type_a_settings_, buffer, MsgLen);
-            if (first_time) {
+            if (first_time && !slave_) {
                 pending_type_a_settings_change_ = true;
             }
         }
@@ -1306,7 +1340,7 @@ private:
             ESP_LOGE(TAG, "Unexpected vane 4 position: %u", vane4);
         }
 
-        auto_dry_.publish_state(buffer[11] & 0x8);
+        publish_switch_state(auto_dry_, buffer[11] & 0x8);
 
         if (sender != MessageSender::Slave) {
             // Handle fan speed 0 (slow) change
@@ -1333,10 +1367,10 @@ private:
             return;
         }
 
-        // Send installer settings the first time we receive a 0xCB message.
+        // The master sends installer settings after the first 0xCB message.
         bool first_time = last_recv_type_b_settings_[0] == 0;
         memcpy(last_recv_type_b_settings_, buffer, MsgLen);
-        if (first_time) {
+        if (first_time && !slave_) {
             pending_type_b_settings_change_ = true;
         }
 
@@ -1467,18 +1501,14 @@ private:
             if (diff <= 0) {
                 ESP_LOGD(TAG, "Turning off for sleep timer");
                 sleep_timer_target_millis_.reset();
-                active_reservation_= false;
-                ignore_sleep_timer_callback_ = true;
-                sleep_timer_.publish_state(0);
-                ignore_sleep_timer_callback_ = false;
+                active_reservation_ = false;
+                publish_sleep_timer(0);
                 this->mode = climate::CLIMATE_MODE_OFF;
                 pending_status_change_ = true;
                 publish_state();
             } else if (optional<uint32_t> minutes = get_sleep_timer_minutes()) {
                 if (sleep_timer_.state != *minutes) {
-                    ignore_sleep_timer_callback_ = true;
-                    sleep_timer_.publish_state(*minutes);
-                    ignore_sleep_timer_callback_ = false;
+                    publish_sleep_timer(*minutes);
                 }
             }
         }
