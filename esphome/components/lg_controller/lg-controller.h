@@ -175,7 +175,7 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     LgSwitch& auto_dry_;
 
     uint8_t recv_buf_[MsgLen] = {};
-    uint32_t recv_buf_len_ = 0;
+    size_t recv_buf_len_ = 0;
     uint32_t last_recv_millis_ = 0;
 
     // Last received 0xC8 message.
@@ -957,21 +957,60 @@ private:
         last_sent_recv_type_b_millis_ = millis();
     }
 
-    void process_message(const uint8_t* buffer, bool* had_error) {
-        ESP_LOGD(TAG, "received %s", format_hex_pretty(buffer, MsgLen).c_str());
+    static bool is_message_start(uint8_t byte) {
+        uint8_t sender = byte & 0xF8;
+        return sender == 0xC8 || sender == 0xA8 || sender == 0x28;
+    }
 
-        if (calc_checksum(buffer) != buffer[12]) {
-            // When initializing, the unit sends an all-zeroes message as padding between
-            // messages. Ignore those false checksum failures.
-            auto is_zero = [](uint8_t b) { return b == 0; };
-            if (std::all_of(buffer, buffer + MsgLen, is_zero)) {
-                ESP_LOGD(TAG, "Ignoring padding message sent by unit");
-                return;
-            }
-            ESP_LOGE(TAG, "invalid checksum %s", format_hex_pretty(buffer, MsgLen).c_str());
-            *had_error = true;
+    void receive_byte(uint8_t byte) {
+        // Ignore padding and noise until we see a possible frame start.
+        if (recv_buf_len_ == 0 && !is_message_start(byte)) {
             return;
         }
+
+        recv_buf_[recv_buf_len_++] = byte;
+        if (recv_buf_len_ < MsgLen) {
+            return;
+        }
+
+        if (calc_checksum(recv_buf_) == recv_buf_[MsgLen - 1]) {
+            process_message(recv_buf_);
+            recv_buf_len_ = 0;
+            return;
+        }
+
+        ESP_LOGW(TAG, "invalid checksum while recovering frame alignment: %s",
+                 format_hex_pretty(recv_buf_, MsgLen).c_str());
+        // Keep the earliest possible start in the remaining bytes.
+        size_t next_start = 1;
+        while (next_start < MsgLen && !is_message_start(recv_buf_[next_start])) {
+            ++next_start;
+        }
+        recv_buf_len_ = MsgLen - next_start;
+        if (recv_buf_len_ > 0) {
+            std::memmove(recv_buf_, recv_buf_ + next_start, recv_buf_len_);
+        }
+    }
+
+    void read_received_messages() {
+        if (recv_buf_len_ > 0 && millis() - last_recv_millis_ > 15 * 1000) {
+            ESP_LOGE(TAG, "discarding incomplete data %s",
+                     format_hex_pretty(recv_buf_, recv_buf_len_).c_str());
+            recv_buf_len_ = 0;
+        }
+
+        while (UARTDevice::available() > 0) {
+            uint8_t byte;
+            if (!UARTDevice::read_byte(&byte)) {
+                break;
+            }
+            last_recv_millis_ = millis();
+            receive_byte(byte);
+        }
+    }
+
+    void process_message(const uint8_t* buffer) {
+        ESP_LOGD(TAG, "received %s", format_hex_pretty(buffer, MsgLen).c_str());
 
         if (pending_send_ != PendingSendKind::None && memcmp(send_buf_, buffer, MsgLen) == 0) {
             ESP_LOGD(TAG, "verified send");
@@ -1005,7 +1044,7 @@ private:
 
         switch (buffer[0] & 0b111) {
             case 0: // 0xC8/A8/28
-                process_status_message(*sender, buffer, had_error);
+                process_status_message(*sender, buffer);
                 break;
             case 1: // 0xC9
                 process_capabilities_message(*sender, buffer);
@@ -1030,14 +1069,7 @@ private:
         }
     }
 
-    void process_status_message(MessageSender sender, const uint8_t* buffer, bool* had_error) {
-        // If we just had a failure, ignore this messsage because it might be invalid too.
-        if (*had_error) {
-            ESP_LOGE(TAG, "ignoring due to previous error %s",
-                     format_hex_pretty(buffer, MsgLen).c_str());
-            return;
-        }
-
+    void process_status_message(MessageSender sender, const uint8_t* buffer) {
         // Consider slave controller initialized if we received a status message from the other
         // controller or the unit.
         if (slave_) {
@@ -1123,7 +1155,6 @@ private:
 
         if (!reported_mode.has_value()) {
             ESP_LOGE(TAG, "received invalid operation mode from AC (%u)", (b >> 2) & 0x07);
-            *had_error = true;
             if (climate_changed) {
                 publish_state();
             }
@@ -1153,7 +1184,6 @@ private:
                 break;
             default:
                 ESP_LOGE(TAG, "received unexpected fan mode from AC (%u)", fan_val);
-                *had_error = true;
                 if (climate_changed) {
                     publish_state();
                 }
@@ -1400,18 +1430,7 @@ private:
     void update() {
         ESP_LOGD(TAG, "update");
 
-        bool had_error = false;
-        while (UARTDevice::available() > 0) {
-            if (!UARTDevice::read_byte(&recv_buf_[recv_buf_len_])) {
-                break;
-            }
-            last_recv_millis_ = millis();
-            recv_buf_len_++;
-            if (recv_buf_len_ == MsgLen) {
-                process_message(recv_buf_, &had_error);
-                recv_buf_len_ = 0;
-            }
-        }
+        read_received_messages();
 
         // If we did not receive the message we sent last time, try to send it again next time.
         // Ignore this when we're initializing because the unit then immediately responds by
@@ -1437,15 +1456,6 @@ private:
         }
 
         if (recv_buf_len_ > 0) {
-            if (millis() - last_recv_millis_ > 15 * 1000) {
-                ESP_LOGE(TAG, "discarding incomplete data %s",
-                         format_hex_pretty(recv_buf_, recv_buf_len_).c_str());
-                recv_buf_len_ = 0;
-            }
-            return;
-        }
-
-        if (had_error) {
             return;
         }
 
