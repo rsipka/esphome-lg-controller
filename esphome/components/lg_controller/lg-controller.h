@@ -168,7 +168,7 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     esphome::binary_sensor::BinarySensor& preheat_;
     esphome::binary_sensor::BinarySensor& outdoor_;
     esphome::binary_sensor::BinarySensor& auto_dry_active_;
-    uint32_t last_outdoor_change_millis_ = 0;
+    optional<uint32_t> outdoor_off_since_{};
 
     LgSwitch& purifier_;
     LgSwitch& internal_thermistor_;
@@ -197,6 +197,10 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     bool pending_status_change_ = false;
     bool pending_type_a_settings_change_ = false;
     bool pending_type_b_settings_change_ = false;
+    // Type A field bits: vane positions 0–3, fan speeds 4–7, Auto Dry 8.
+    static constexpr uint16_t TYPE_A_AUTO_DRY = 1U << 8;
+    uint16_t pending_type_a_fields_ = 0;
+    uint16_t sent_type_a_fields_ = 0;
 
     bool is_initializing_ = true;
 
@@ -258,9 +262,9 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
             case LgCapability::FAN_POWER:
                 return (nvs_storage_.capabilities_message[3] & 0x02) != 0;
             case LgCapability::MODE_HEATING:
-                return (nvs_storage_.capabilities_message[2] & 0x40) != 0;
+                return (nvs_storage_.capabilities_message[2] & 0x20) != 0;
             case LgCapability::MODE_FAN:
-                return (nvs_storage_.capabilities_message[2] & 0x80) != 0;
+                return (nvs_storage_.capabilities_message[2] & 0x40) != 0;
             case LgCapability::MODE_AUTO:
                 return (nvs_storage_.capabilities_message[2] & 0x08) != 0;
             case LgCapability::MODE_DEHUMIDIFY:
@@ -458,7 +462,7 @@ public:
         });
         auto_dry_.add_on_state_callback([this](bool) {
             if (!ignore_switch_callbacks_) {
-                pending_type_a_settings_change_ = true;
+                queue_type_a_change(TYPE_A_AUTO_DRY);
             }
         });
     }
@@ -529,6 +533,15 @@ public:
     }
 
 private:
+    void queue_type_a_change(uint16_t field) {
+        pending_type_a_fields_ |= field;
+        pending_type_a_settings_change_ = true;
+    }
+
+    bool is_type_a_field_pending(uint16_t field) const {
+        return ((pending_type_a_fields_ | sent_type_a_fields_) & field) != 0;
+    }
+
     static optional<climate::ClimateMode> decode_status_mode(uint8_t status) {
         if ((status & 0x02) == 0) {
             return climate::CLIMATE_MODE_OFF;
@@ -593,7 +606,7 @@ private:
         ESP_LOGD(TAG, "Setting vane %d position: %d", index, position);
         vane_position_[index-1] = position;
         if (!is_initializing_) {
-            pending_type_a_settings_change_ = true;
+            queue_type_a_change(1U << (index - 1));
         }
     }
 
@@ -614,7 +627,7 @@ private:
 
         fan_speed_[index] = value;
         if (!is_initializing_) {
-            pending_type_a_settings_change_ = true;
+            queue_type_a_change(1U << (index + 4));
         }
     }
 
@@ -905,12 +918,6 @@ private:
     }
 
     void send_type_a_settings_message() {
-        if (last_recv_type_a_settings_[0] != 0xCA && last_recv_type_a_settings_[0] != 0xAA) {
-            ESP_LOGE(TAG, "Unexpected missing previous CA/AA message");
-            pending_type_a_settings_change_ = false;
-            return;
-        }
-
         // Copy settings from the CA/AA message we received.
         memcpy(send_buf_, last_recv_type_a_settings_, MsgLen);
         send_buf_[0] = slave_ ? 0x2A : 0xAA;
@@ -940,6 +947,8 @@ private:
         UARTDevice::write_array(send_buf_, MsgLen);
 
         pending_type_a_settings_change_ = false;
+        sent_type_a_fields_ = pending_type_a_fields_;
+        pending_type_a_fields_ = 0;
         pending_send_ = PendingSendKind::TypeA;
     }
 
@@ -1036,6 +1045,9 @@ private:
 
         if (pending_send_ != PendingSendKind::None && memcmp(send_buf_, buffer, MsgLen) == 0) {
             ESP_LOGD(TAG, "verified send");
+            if (pending_send_ == PendingSendKind::TypeA) {
+                sent_type_a_fields_ = 0;
+            }
             pending_send_ = PendingSendKind::None;
             return;
         }
@@ -1108,23 +1120,23 @@ private:
             error_code_.publish_state(buffer[11]);
         }
 
-        // When turning on the outdoor unit, the AC sometimes reports ON => OFF => ON within a
-        // few seconds. No big deal but it causes noisy state changes in HA. Only report OFF if
-        // the last state change was at least 8 seconds ago.
+        // Ignore short OFF pulses while the outdoor unit is starting.
         bool outdoor_on = buffer[5] & 0x4;
-        bool outdoor_changed = outdoor_.state != outdoor_on;
         if (outdoor_on) {
+            outdoor_off_since_.reset();
             outdoor_.publish_state(true);
-        } else if (millis() - last_outdoor_change_millis_ > 8000) {
+        } else if (!outdoor_.state) {
             outdoor_.publish_state(false);
-        }
-        if (outdoor_changed) {
-            last_outdoor_change_millis_ = millis();
+        } else if (!outdoor_off_since_.has_value()) {
+            outdoor_off_since_ = millis();
+        } else if (millis() - *outdoor_off_since_ >= 8000) {
+            outdoor_.publish_state(false);
+            outdoor_off_since_.reset();
         }
 
         if (sender == MessageSender::Unit && !auto_dry_.is_internal()) {
             bool unit_off = (buffer[1] & 0x2) == 0;
-            bool drying = (buffer[10] & 0x10) && unit_off;
+            bool drying = (buffer[10] & 0x20) && unit_off;
             auto_dry_active_.publish_state(drying);
         }
 
@@ -1136,7 +1148,8 @@ private:
             // Report the unit's room temperature only if we're using the internal thermistor.
             // With an external temperature sensor, some units report the temperature we sent and
             // others always send the internal temperature.
-            read_temp = (sender == MessageSender::Unit && internal_thermistor_.state);
+            read_temp = sender == MessageSender::Unit &&
+                        (internal_thermistor_.state || !get_room_temp().has_value());
         }
         bool climate_changed = false;
         if (read_temp) {
@@ -1273,21 +1286,21 @@ private:
         if (nvs_storage_.capabilities_message[0] == 0 ||
             std::memcmp(nvs_storage_.capabilities_message, buffer, MsgLen - 1) != 0) {
 
-            bool needsRestart = (nvs_storage_.capabilities_message[0] == 0);
-
+            bool first_capabilities = nvs_storage_.capabilities_message[0] == 0;
+            NVSStorage updated;
+            std::memcpy(updated.capabilities_message, buffer, MsgLen);
             ESPPreferenceObject pref = global_preferences->make_preference<NVSStorage>(this->get_object_id_hash() ^ NVS_STORAGE_VERSION);
-            memcpy(nvs_storage_.capabilities_message, buffer, MsgLen);
-
-            // If no capabilities were stored in NVS before, restart to make sure we get the correct traits for climate
-            // No restart just on changes (which is unlikely anyway) to make sure we don't end up in a bootloop for faulty devices / communication
-            if (needsRestart) {
-                pref.save(&nvs_storage_);
-                global_preferences->sync();
-                ESP_LOGD(TAG, "restarting to apply initial capabilities");
-                App.safe_reboot();
-            }
-            else {
-                ESP_LOGD(TAG, "updated device capabilities, manual restart required to take effect");
+            if (pref.save(&updated) && global_preferences->sync()) {
+                nvs_storage_ = updated;
+                // Only reboot automatically for the first saved capabilities.
+                if (first_capabilities) {
+                    ESP_LOGD(TAG, "restarting to apply initial capabilities");
+                    App.safe_reboot();
+                } else {
+                    ESP_LOGD(TAG, "saved updated device capabilities, manual restart required to take effect");
+                }
+            } else {
+                ESP_LOGW(TAG, "unable to save device capabilities");
             }
         }
 
@@ -1304,60 +1317,32 @@ private:
             }
         }
 
-        // Handle vane 1 position change
-        uint8_t vane1 = buffer[7] & 0x0F;
-        if (vane1 <= 6) {
-            vane_position_[0] = vane1;
-            vane_select_1_.publish_state(*vane_select_1_.at(vane1));
-        } else {
-            ESP_LOGE(TAG, "Unexpected vane 1 position: %u", vane1);
+        LgSelect* const vanes[] = {&vane_select_1_, &vane_select_2_, &vane_select_3_, &vane_select_4_};
+        for (size_t i = 0; i < 4; ++i) {
+            if (is_type_a_field_pending(1U << i)) {
+                continue;
+            }
+            uint8_t position = (buffer[7 + i / 2] >> ((i % 2) * 4)) & 0x0F;
+            if (position <= 6) {
+                vane_position_[i] = position;
+                vanes[i]->publish_state(*vanes[i]->at(position));
+            } else {
+                ESP_LOGE(TAG, "Unexpected vane %u position: %u", unsigned(i + 1), position);
+            }
         }
 
-        // Handle vane 2 position change
-        uint8_t vane2 = (buffer[7] >> 4) & 0x0F;
-        if (vane2 <= 6) {
-            vane_position_[1] = vane2;
-            vane_select_2_.publish_state(*vane_select_2_.at(vane2));
-        } else {
-            ESP_LOGE(TAG, "Unexpected vane 2 position: %u", vane2);
+        if (!is_type_a_field_pending(TYPE_A_AUTO_DRY)) {
+            publish_switch_state(auto_dry_, buffer[11] & 0x8);
         }
-
-        // Handle vane 3 position change
-        uint8_t vane3 = buffer[8] & 0x0F;
-        if (vane3 <= 6) {
-            vane_position_[2] = vane3;
-            vane_select_3_.publish_state(*vane_select_3_.at(vane3));
-        } else {
-            ESP_LOGE(TAG, "Unexpected vane 3 position: %u", vane3);
-        }
-
-        // Handle vane 4 position change
-        uint8_t vane4 = (buffer[8] >> 4) & 0x0F;
-        if (vane4 <= 6) {
-            vane_position_[3] = vane4;
-            vane_select_4_.publish_state(*vane_select_4_.at(vane4));
-        } else {
-            ESP_LOGE(TAG, "Unexpected vane 4 position: %u", vane4);
-        }
-
-        publish_switch_state(auto_dry_, buffer[11] & 0x8);
 
         if (sender != MessageSender::Slave) {
-            // Handle fan speed 0 (slow) change
-            fan_speed_[0] = buffer[2];
-            fan_speed_slow_.publish_state(fan_speed_[0]);
-
-            // Handle fan speed 1 (low) change
-            fan_speed_[1] = buffer[3];
-            fan_speed_low_.publish_state(fan_speed_[1]);
-
-            // Handle fan speed 2 (medium) change
-            fan_speed_[2] = buffer[4];
-            fan_speed_medium_.publish_state(fan_speed_[2]);
-
-            // Handle fan speed 3 (high) change
-            fan_speed_[3] = buffer[5];
-            fan_speed_high_.publish_state(fan_speed_[3]);
+            LgNumber* const speeds[] = {&fan_speed_slow_, &fan_speed_low_, &fan_speed_medium_, &fan_speed_high_};
+            for (size_t i = 0; i < 4; ++i) {
+                if (!is_type_a_field_pending(1U << (i + 4))) {
+                    fan_speed_[i] = buffer[2 + i];
+                    speeds[i]->publish_state(fan_speed_[i]);
+                }
+            }
         }
     }
 
@@ -1469,13 +1454,15 @@ private:
         // If we did not receive the message we sent last time, try to send it again next time.
         // Ignore this when we're initializing because the unit then immediately responds by
         // sending a lot of messages and this introduces a delay.
-        if (pending_send_ != PendingSendKind::None && !is_initializing_) {
+        if (pending_send_ != PendingSendKind::None && (!is_initializing_ || sent_type_a_fields_ != 0)) {
             ESP_LOGE(TAG, "did not receive message we just sent");
             switch (pending_send_) {
                 case PendingSendKind::Status:
                     pending_status_change_ = true;
                     break;
                 case PendingSendKind::TypeA:
+                    pending_type_a_fields_ |= sent_type_a_fields_;
+                    sent_type_a_fields_ = 0;
                     pending_type_a_settings_change_ = true;
                     break;
                 case PendingSendKind::TypeB:
@@ -1544,7 +1531,8 @@ private:
             }
         };
 
-        if (pending_type_a_settings_change_) {
+        if (pending_type_a_settings_change_ &&
+            (last_recv_type_a_settings_[0] == 0xCA || last_recv_type_a_settings_[0] == 0xAA)) {
             if (check_can_send()) {
                 send_type_a_settings_message();
             }
