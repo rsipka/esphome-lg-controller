@@ -180,6 +180,11 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
 
     // Last received 0xC8 message.
     uint8_t last_recv_status_[MsgLen] = {};
+    struct MasterTemperatureFields {
+        uint8_t thermistor_bits;
+        uint8_t room_temperature_bits;
+    };
+    optional<MasterTemperatureFields> master_temperature_fields_{};
 
     // Last received 0xCA message.
     uint8_t last_recv_type_a_settings_[MsgLen] = {};
@@ -204,6 +209,7 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     static constexpr uint16_t TYPE_A_AUTO_DRY = 1U << 8;
     uint16_t pending_type_a_fields_ = 0;
     uint16_t sent_type_a_fields_ = 0;
+    bool publishing_type_a_settings_ = false;
 
     bool is_initializing_ = true;
     bool slave_status_synced_ = false;
@@ -222,7 +228,9 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     uint8_t overheating_ = 0;
 
     optional<uint32_t> sleep_timer_target_millis_{};
-    uint32_t last_reported_sleep_minutes_ = 0;
+    optional<uint32_t> last_peer_sleep_command_minutes_{};
+    static constexpr uint8_t SLEEP_TIMER_KIND = 3;
+    bool sleep_timer_cancel_pending_ = false;
     bool active_reservation_ = false;
     bool ignore_sleep_timer_callback_ = false;
     bool ignore_switch_callbacks_ = false;
@@ -638,14 +646,13 @@ private:
             ESP_LOGE(TAG, "Unexpected vane position: %d", position);
             return;
         }
-        if (vane_position_[index-1] == position) {
+        if (publishing_type_a_settings_ ||
+            (last_recv_type_a_settings_[0] != 0 && vane_position_[index-1] == position)) {
             return;
         }
         ESP_LOGD(TAG, "Setting vane %d position: %d", index, position);
         vane_position_[index-1] = position;
-        if (!is_initializing_) {
-            queue_type_a_change(1U << (index - 1));
-        }
+        queue_type_a_change(1U << (index - 1));
     }
 
     // Sets installer setting fan speed index (0-3 for slow-high) to value (0-255), with "0" being the factory default
@@ -659,14 +666,13 @@ private:
             return;
         }
 
-        if (fan_speed_[index] == value) {
+        if (publishing_type_a_settings_ ||
+            (last_recv_type_a_settings_[0] != 0 && fan_speed_[index] == value)) {
             return;
         }
 
         fan_speed_[index] = value;
-        if (!is_initializing_) {
-            queue_type_a_change(1U << (index + 4));
-        }
+        queue_type_a_change(1U << (index + 4));
     }
 
     // Set overheating installer setting 15 to 0-4.
@@ -694,15 +700,18 @@ private:
             return false;
         }
         ESP_LOGD(TAG, "Setting sleep timer: %d minutes", minutes);
-        last_reported_sleep_minutes_ = minutes;
-        if (minutes > 0) {
-            sleep_timer_target_millis_ = millis() + unsigned(minutes) * 60 * 1000;
-            active_reservation_ = true;
+        sleep_timer_cancel_pending_ = minutes == 0;
+        apply_sleep_timer(minutes);
+        return true;
+    }
+
+    void apply_sleep_timer(uint32_t minutes) {
+        active_reservation_ = minutes != 0;
+        if (active_reservation_) {
+            sleep_timer_target_millis_ = millis() + minutes * 60000;
         } else {
             sleep_timer_target_millis_.reset();
-            active_reservation_ = false;
         }
-        return true;
     }
 
     void publish_sleep_timer(uint32_t minutes) {
@@ -750,38 +759,46 @@ private:
         return (uint32_t(diff) + 59999) / 60000;
     }
 
-    void sync_sleep_timer(const uint8_t* buffer) {
-        active_reservation_ = buffer[3] & 0x10;
-        if (((buffer[8] >> 3) & 0x7) != 3) {
-            if (!active_reservation_) {
-                sleep_timer_target_millis_.reset();
-                last_reported_sleep_minutes_ = 0;
-                if (sleep_timer_.state > 0) {
-                    publish_sleep_timer(0);
-                }
+    void sync_sleep_timer(MessageSender sender, const uint8_t* buffer) {
+        bool reservation_active = buffer[3] & 0x10;
+        uint8_t kind = (buffer[8] >> 3) & 0x7;
+        uint32_t minutes = (uint32_t(buffer[8] & 0x7) << 8) | buffer[9];
+        bool sleep_timer_cleared = (kind == SLEEP_TIMER_KIND && minutes == 0) ||
+                                   (kind != SLEEP_TIMER_KIND && !reservation_active) || kind == 4;
+        if (sleep_timer_cleared) {
+            sleep_timer_cancel_pending_ = false;
+            last_peer_sleep_command_minutes_.reset();
+            apply_sleep_timer(0);
+            if (sleep_timer_.state > 0) {
+                publish_sleep_timer(0);
             }
             return;
         }
-
-        uint32_t minutes = (uint32_t(buffer[8] & 0x7) << 8) | buffer[9];
-        if (minutes > 7 * 60) {
+        // A send echo alone does not confirm the unit has cleared its timer.
+        if (sleep_timer_cancel_pending_) {
             return;
         }
-        if (minutes == 0) {
-            set_sleep_timer(0);
-        } else if (!slave_) {
-            // Equal reports are echoes. A lower report can shorten the countdown, and a
-            // higher report is a new duration. Keep the last value after local expiry.
-            if (minutes > last_reported_sleep_minutes_) {
-                set_sleep_timer(minutes);
-            } else if (sleep_timer_target_millis_.has_value()) {
+        active_reservation_ = reservation_active;
+        if (kind != SLEEP_TIMER_KIND || minutes > 7 * 60) {
+            return;
+        }
+        if (!slave_) {
+            // Unit reports can shorten a countdown. A new command from another controller can
+            // also extend it. Repeated copies of that command are treated as reports.
+            bool new_peer_command = sender == MessageSender::Slave && (buffer[1] & 0x01) &&
+                                    last_peer_sleep_command_minutes_ != minutes;
+            if (new_peer_command) {
+                last_peer_sleep_command_minutes_ = minutes;
+            }
+            if (!sleep_timer_target_millis_.has_value() || new_peer_command) {
+                apply_sleep_timer(minutes);
+            } else {
                 uint32_t now = millis();
                 uint32_t duration = minutes * 60000;
                 if (int32_t(*sleep_timer_target_millis_ - now) > int32_t(duration)) {
                     sleep_timer_target_millis_ = now + duration;
                 }
             }
-            last_reported_sleep_minutes_ = minutes;
             minutes = get_sleep_timer_minutes().value_or(0);
         }
         publish_sleep_timer(minutes);
@@ -924,22 +941,22 @@ private:
             send_buf_[5] |= 0x1;
         }
 
-        // Byte 6: thermistor setting and target temperature (fractional part in byte 5).
-        // Byte 7: room temperature. Preserve the (unknown) upper two bits.
-        enum ThermistorSetting { Unit = 0, Controller = 1, TwoTH = 2 };
-        ThermistorSetting thermistor =
-            internal_thermistor_.state ? ThermistorSetting::Unit : ThermistorSetting::Controller;
-        float temp;
-        if (auto maybe_temp = get_room_temp()) {
-            temp = *maybe_temp;
+        // Preserve ceiling height in byte 6 and the heating/cooling flags in byte 7.
+        uint8_t thermistor_bits = last_recv_status_[6] & 0x30;
+        uint8_t room_temperature_bits = last_recv_status_[7] & 0x3F;
+        optional<float> external_temperature;
+        if (slave_) {
+            if (master_temperature_fields_.has_value()) {
+                thermistor_bits = master_temperature_fields_->thermistor_bits;
+                room_temperature_bits = master_temperature_fields_->room_temperature_bits;
+            }
         } else {
-            // Room temperature isn't available. Use the unit's thermistor and send something
-            // reasonable.
-            thermistor = ThermistorSetting::Unit;
-            temp = 20;
+            external_temperature = get_room_temp();
+            thermistor_bits = !internal_thermistor_.state && external_temperature.has_value() ? 0x10 : 0;
+            room_temperature_bits = uint8_t((external_temperature.value_or(20.0f) - 10) * 2);
         }
-        send_buf_[6] = (thermistor << 4) | ((uint8_t(target) - 15) & 0xf);
-        send_buf_[7] = (last_recv_status_[7] & 0xC0) | uint8_t((temp - 10) * 2);
+        send_buf_[6] = (last_recv_status_[6] & 0xC0) | thermistor_bits | ((uint8_t(target) - 15) & 0x0F);
+        send_buf_[7] = (last_recv_status_[7] & 0xC0) | room_temperature_bits;
 
         // Bytes 8-10. Initialize bytes 8-9 to 0 to not echo back timer settings set by the AC.
         send_buf_[8] = 0;
@@ -954,12 +971,14 @@ private:
                 send_buf_[9] |= 0x40;
             }
             send_buf_[10] = 0x80;
+        } else if (sleep_timer_cancel_pending_) {
+            // A sleep-timer message with zero minutes cancels that reservation.
+            send_buf_[8] = SLEEP_TIMER_KIND << 3;
         } else if (optional<uint32_t> minutes = get_sleep_timer_minutes()) {
             // Set sleep timer.
             // Byte 8 stores the kind (0x38) and high bits of number of minutes (0x7).
             // Byte 9 stores the low bits of the number of minutes.
-            constexpr uint8_t timer_kind_sleep = 3;
-            send_buf_[8] = timer_kind_sleep << 3;
+            send_buf_[8] = SLEEP_TIMER_KIND << 3;
             send_buf_[8] |= (*minutes >> 8) & 0b111;
             send_buf_[9] = *minutes & 0xff;
         }
@@ -979,8 +998,8 @@ private:
 
         // If we sent an updated temperature to the AC, update temperature in HA too.
         // Slave controller temperature sensor is ignored.
-        if (!slave_ && thermistor == ThermistorSetting::Controller) {
-            float ha_temp = temp;
+        if (thermistor_bits == 0x10 && external_temperature.has_value()) {
+            float ha_temp = *external_temperature;
             if (fahrenheit_) {
                 ha_temp = TempConversion::lgcelsius_to_celsius(ha_temp);
             }
@@ -1221,6 +1240,9 @@ private:
         if (slave_) {
             // Let the slave controller report the temperature from the master.
             read_temp = (sender == MessageSender::Master);
+            if (read_temp) {
+                master_temperature_fields_ = {uint8_t(buffer[6] & 0x30), uint8_t(buffer[7] & 0x3F)};
+            }
         } else {
             // Report the unit's room temperature only if we're using the internal thermistor.
             // With an external temperature sensor, some units report the temperature we sent and
@@ -1319,7 +1341,7 @@ private:
             this->target_temperature = target;
         }
         if (!(startup_status_fields_ & STARTUP_TIMER)) {
-            sync_sleep_timer(buffer);
+            sync_sleep_timer(sender, buffer);
         }
         if (syncing_slave) {
             slave_status_synced_ = true;
@@ -1374,6 +1396,7 @@ private:
             }
         }
 
+        publishing_type_a_settings_ = true;
         LgSelect* const vanes[] = {&vane_select_1_, &vane_select_2_, &vane_select_3_, &vane_select_4_};
         for (size_t i = 0; i < 4; ++i) {
             if (is_type_a_field_pending(1U << i)) {
@@ -1401,6 +1424,7 @@ private:
                 }
             }
         }
+        publishing_type_a_settings_ = false;
     }
 
     void process_type_b_settings_message(MessageSender sender, const uint8_t* buffer) {
@@ -1554,8 +1578,8 @@ private:
             int32_t diff = int32_t(sleep_timer_target_millis_.value() - millis_now);
             if (diff <= 0) {
                 ESP_LOGD(TAG, "Turning off for sleep timer");
-                sleep_timer_target_millis_.reset();
-                active_reservation_ = false;
+                apply_sleep_timer(0);
+                sleep_timer_cancel_pending_ = true;
                 publish_sleep_timer(0);
                 this->mode = climate::CLIMATE_MODE_OFF;
                 pending_status_change_ = true;
