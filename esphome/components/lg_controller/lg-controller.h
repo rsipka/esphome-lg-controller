@@ -216,7 +216,10 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     static constexpr uint32_t SETTINGS_READBACK_TIMEOUT_MS = 15000;
 
     bool is_initializing_ = true;
+    static constexpr uint32_t CAPABILITIES_TIMEOUT_MS = 15000;
+    optional<uint32_t> initial_settings_request_millis_{};
     bool slave_status_synced_ = false;
+    bool prefer_status_send_ = true;
     enum StartupStatusField : uint8_t {
         STARTUP_MODE = 1U << 0,
         STARTUP_TARGET = 1U << 1,
@@ -227,6 +230,11 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     };
     uint8_t startup_status_fields_ = 0;
 
+    static constexpr uint8_t FAN_LOW_MEDIUM_SPEED = 5;
+    static constexpr uint8_t FAN_MEDIUM_HIGH_SPEED = 6;
+    static constexpr const char* FAN_MODE_LOW_MEDIUM = "Low-Medium";
+    static constexpr const char* FAN_MODE_MEDIUM_HIGH = "Medium-High";
+    uint8_t intermediate_fan_speed_ = 0;
     uint8_t vane_position_[4] = {0,0,0,0};
     uint8_t fan_speed_[4] = {0,0,0,0};
     uint8_t overheating_ = 0;
@@ -263,6 +271,7 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
         FAN_MEDIUM_HIGH,
         FAN_HIGH,
         FAN_POWER,
+        WHOLE_DEGREE_SETPOINT,
         MODE_HEATING,
         MODE_FAN,
         MODE_AUTO,
@@ -289,6 +298,8 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
                 return true;
             case LgCapability::FAN_POWER:
                 return (nvs_storage_.capabilities_message[3] & 0x02) != 0;
+            case LgCapability::WHOLE_DEGREE_SETPOINT:
+                return (nvs_storage_.capabilities_message[5] & 0x20) != 0;
             case LgCapability::MODE_HEATING:
                 return (nvs_storage_.capabilities_message[2] & 0x20) != 0;
             case LgCapability::MODE_FAN:
@@ -336,7 +347,8 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
         supported_traits_.set_visual_min_temperature(MIN_TEMP_SETPOINT);
         supported_traits_.set_visual_max_temperature(MAX_TEMP_SETPOINT);
         supported_traits_.set_visual_current_temperature_step(fahrenheit_ ? 1 : 0.5);
-        supported_traits_.set_visual_target_temperature_step(fahrenheit_ ? 1 : 0.5);
+        supported_traits_.set_visual_target_temperature_step(
+            fahrenheit_ || parse_capability(LgCapability::WHOLE_DEGREE_SETPOINT) ? 1 : 0.5);
 
         // Only override defaults if the capabilities are known
         if (nvs_storage_.capabilities_message[0] != 0) {
@@ -368,6 +380,12 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
             if (parse_capability(LgCapability::FAN_POWER))
                 override_fan_modes.insert(climate::CLIMATE_FAN_FOCUS);
             supported_traits_.set_supported_fan_modes(override_fan_modes);
+            std::vector<const char*> custom_fan_modes;
+            if (parse_capability(LgCapability::FAN_LOW_MEDIUM))
+                custom_fan_modes.push_back(FAN_MODE_LOW_MEDIUM);
+            if (parse_capability(LgCapability::FAN_MEDIUM_HIGH))
+                custom_fan_modes.push_back(FAN_MODE_MEDIUM_HIGH);
+            this->set_supported_custom_fan_modes(custom_fan_modes);
 
             climate::ClimateSwingModeMask override_swing_modes;
             override_swing_modes.insert(climate::CLIMATE_SWING_OFF);
@@ -551,7 +569,13 @@ public:
             fields |= STARTUP_TARGET;
         }
         if (call.get_fan_mode().has_value()) {
-            this->fan_mode = *call.get_fan_mode();
+            intermediate_fan_speed_ = 0;
+            this->set_fan_mode_(*call.get_fan_mode());
+            fields |= STARTUP_FAN;
+        }
+        if (call.has_custom_fan_mode()) {
+            intermediate_fan_speed_ = 0;
+            this->set_custom_fan_mode_(call.get_custom_fan_mode());
             fields |= STARTUP_FAN;
         }
         if (call.get_swing_mode().has_value()) {
@@ -905,8 +929,14 @@ private:
                 break;
         }
         
-        // Fix: Check if fan_mode has a value before dereferencing
-        if (this->fan_mode.has_value()) {
+        uint8_t intermediate_speed = intermediate_fan_speed_;
+        if (this->has_custom_fan_mode()) {
+            intermediate_speed = this->get_custom_fan_mode() == FAN_MODE_LOW_MEDIUM
+                                     ? FAN_LOW_MEDIUM_SPEED : FAN_MEDIUM_HIGH_SPEED;
+        }
+        if (intermediate_speed != 0) {
+            b |= intermediate_speed << 5;
+        } else if (this->fan_mode.has_value()) {
             switch (this->fan_mode.value()) {
                 case climate::CLIMATE_FAN_LOW:
                     b |= 0 << 5;
@@ -980,7 +1010,9 @@ private:
             target = 20.0f;
         }
         target = std::clamp(target, float(MIN_TEMP_SETPOINT), float(MAX_TEMP_SETPOINT));
-        uint8_t target_half_degrees = uint8_t(std::lround(target * 2));
+        uint8_t target_half_degrees = parse_capability(LgCapability::WHOLE_DEGREE_SETPOINT)
+                                          ? uint8_t(std::lround(target) * 2)
+                                          : uint8_t(std::lround(target * 2));
 
         // Byte 5. Unchanged except for the low bit which indicates the target temperature has a
         // 0.5 fractional part.
@@ -1011,6 +1043,9 @@ private:
         if (is_initializing_) {
             // Request settings when controller turns on.
             send_buf_[8] |= 0x40;
+            if (!initial_settings_request_millis_.has_value()) {
+                initial_settings_request_millis_ = millis();
+            }
             // Set bit 0x80 of byte 10 to use byte 9 for the Fahrenheit setting flag (0x40).
             if (fahrenheit_) {
                 send_buf_[9] |= 0x40;
@@ -1328,6 +1363,11 @@ private:
         auto reported_mode = decode_status_mode(b);
         // The unit reports its live action even while a local setting change is pending.
         if (sender == MessageSender::Unit && reported_mode.has_value()) {
+            if (!slave_ && is_initializing_ && initial_settings_request_millis_.has_value() &&
+                millis() - *initial_settings_request_millis_ >= CAPABILITIES_TIMEOUT_MS) {
+                is_initializing_ = false;
+                ESP_LOGW(TAG, "No capability frame after startup request; continuing with available capabilities");
+            }
             auto reported_action = action_from_status(*reported_mode, buffer);
             if (this->action != reported_action) {
                 this->action = reported_action;
@@ -1354,13 +1394,6 @@ private:
         }
         uint8_t fan_val = b >> 5;
         auto reported_fan = decode_status_fan_mode(fan_val);
-        if (!reported_fan.has_value()) {
-            ESP_LOGE(TAG, "received unexpected fan mode from AC (%u)", fan_val);
-            if (climate_changed) {
-                publish_state();
-            }
-            return;
-        }
 
         if (sender != MessageSender::Slave) {
             memcpy(last_recv_status_, buffer, MsgLen);
@@ -1370,7 +1403,22 @@ private:
             this->mode = *reported_mode;
         }
         if (!(startup_status_fields_ & STARTUP_FAN)) {
-            this->fan_mode = *reported_fan;
+            if (reported_fan.has_value()) {
+                intermediate_fan_speed_ = 0;
+                this->set_fan_mode_(*reported_fan);
+            } else {
+                // These speeds remain valid on the wire even when the capabilities are unknown.
+                intermediate_fan_speed_ = fan_val;
+                bool low_medium = fan_val == FAN_LOW_MEDIUM_SPEED;
+                if (parse_capability(low_medium ? LgCapability::FAN_LOW_MEDIUM : LgCapability::FAN_MEDIUM_HIGH)) {
+                    this->set_custom_fan_mode_(low_medium ? FAN_MODE_LOW_MEDIUM : FAN_MODE_MEDIUM_HIGH);
+                    if (!this->has_custom_fan_mode()) {
+                        this->set_fan_mode_(climate::CLIMATE_FAN_MEDIUM);
+                    }
+                } else {
+                    this->set_fan_mode_(climate::CLIMATE_FAN_MEDIUM);
+                }
+            }
         }
         if (!(startup_status_fields_ & STARTUP_PURIFIER)) {
             publish_switch_state(purifier_, buffer[2] & 0x4);
@@ -1716,36 +1764,35 @@ private:
             }
         };
 
-        if (pending_type_a_settings_change_ &&
-            (last_recv_type_a_settings_[0] == 0xCA || last_recv_type_a_settings_[0] == 0xAA)) {
+        bool type_a_due = pending_type_a_settings_change_ &&
+                          (last_recv_type_a_settings_[0] == 0xCA || last_recv_type_a_settings_[0] == 0xAA);
+        bool type_b_due = pending_type_b_settings_change_ && last_recv_type_b_settings_[0] != 0;
+        bool status_change_due = pending_status_change_ || (!is_initializing_ && sleep_timer_command_pending_);
+        bool status_due = status_change_due || (!slave_ && millis_now - last_sent_status_millis_ > 20 * 1000);
+        // Alternate status and settings when both are queued, including settings retries.
+        if (status_due && (prefer_status_send_ || (!type_a_due && !type_b_due))) {
+            if (check_can_send()) {
+                pending_status_change_ = status_change_due;
+                send_status_message();
+                prefer_status_send_ = false;
+                // Some units reset the vane position after changing swing or operation mode.
+                if (status_change_due) {
+                    pending_type_a_settings_change_ = true;
+                }
+            }
+            return;
+        }
+        if (type_a_due) {
             if (check_can_send()) {
                 send_type_a_settings_message();
+                prefer_status_send_ = true;
             }
             return;
         }
-        if (pending_type_b_settings_change_ && last_recv_type_b_settings_[0] != 0) {
+        if (type_b_due) {
             if (check_can_send()) {
                 send_type_b_settings_message(/* timed = */ false);
-            }
-            return;
-        }
-        // Send a status message if there is a pending change.
-        // Additionally, queue a Type A message after sending the status message because some
-        // units set the vane position to the default setting after changing swing mode or
-        // operation mode.
-        if (pending_status_change_ || (!is_initializing_ && sleep_timer_command_pending_)) {
-            if (check_can_send()) {
-                pending_status_change_ = true;
-                send_status_message();
-                pending_type_a_settings_change_ = true;
-            }
-            return;
-        }
-        // Send a status message every 20 seconds.
-        // Slave controllers only send a status message when settings are changed.
-        if (!slave_ && millis_now - last_sent_status_millis_ > 20 * 1000) {
-            if (check_can_send()) {
-                send_status_message();
+                prefer_status_send_ = true;
             }
             return;
         }
