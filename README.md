@@ -106,6 +106,7 @@ If you just want to connect to the device to view the debug logs, use `esphome l
 # Features
 Features currently available in Home Assistant:
 * Operation mode (off, auto, cool, heat, dry/dehumidify, fan only).
+* Current HVAC action inferred from the indoor unit's status, including idle, heating, cooling, and defrosting.
 * Target temperature (0.5°C steps).
 * Use of a Home Assistant temperature sensor for room temperature (rounded to nearest 0.5°C). 
 * Fan speed (slow, low, medium, high, auto).
@@ -145,6 +146,26 @@ Add either or both of these entries under the existing `lg_controller` climate p
 Each sensor updates when the indoor unit sends the corresponding wired-bus frame.
 Some models expose energy data only through ThinQ.
 The wired-bus energy total can differ from the total shown in ThinQ.
+
+## Enable additional status sensors
+
+Add any of these entries under the existing `lg_controller` climate platform in
+`esphome/base.yaml` or your local copy of that configuration.
+
+```yaml
+    humidity:
+      name: Humidity
+    fan_operation_time:
+      name: Fan Operation Time
+    indoor_unit_operation_time:
+      name: Indoor Unit Operation Time
+    precise_room_temperature:
+      name: Precise Room Temperature
+```
+
+These sensors update when the bus carries the matching `CE.80` status frame, or an
+`AE.80` frame from the master wall controller when the ESP is configured as a slave.
+The precise temperature is reported separately from the climate entity's current temperature.
 
 # Tips
 * [Issue #43](https://github.com/JanM321/esphome-lg-controller/issues/43) has some information on temperature sensors that work well for this.

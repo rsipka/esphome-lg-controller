@@ -6,12 +6,18 @@ from esphome.const import (
     CONF_ID,
     CONF_INTERNAL,
     CONF_RX_PIN,
+    DEVICE_CLASS_DURATION,
     DEVICE_CLASS_ENERGY,
+    DEVICE_CLASS_HUMIDITY,
     DEVICE_CLASS_POWER,
+    DEVICE_CLASS_TEMPERATURE,
     STATE_CLASS_MEASUREMENT,
     STATE_CLASS_TOTAL_INCREASING,
+    UNIT_CELSIUS,
+    UNIT_HOUR,
     UNIT_KILOWATT,
     UNIT_KILOWATT_HOURS,
+    UNIT_PERCENT,
 )
 
 CODEOWNERS = ["JanM321"]
@@ -49,6 +55,10 @@ CONF_PIPE_TEMP_MID = "pipe_temp_mid"
 CONF_PIPE_TEMP_OUT = "pipe_temp_out"
 CONF_POWER_CONSUMPTION = "power_consumption"
 CONF_CURRENT_POWER = "current_power"
+CONF_HUMIDITY = "humidity"
+CONF_FAN_OPERATION_TIME = "fan_operation_time"
+CONF_INDOOR_UNIT_OPERATION_TIME = "indoor_unit_operation_time"
+CONF_PRECISE_ROOM_TEMPERATURE = "precise_room_temperature"
 
 CONF_DEFROST = "defrost"
 CONF_PREHEAT = "preheat"
@@ -83,7 +93,7 @@ CONFIG_SCHEMA = climate.climate_schema(LgController).extend(
         cv.Required(CONF_FAN_SPEED_HIGH): number.number_schema(LgNumber),
         cv.Required(CONF_SLEEP_TIMER): number.number_schema(LgNumber),
 
-        cv.Required(CONF_ERROR_CODE): sensor.sensor_schema(),
+        cv.Required(CONF_ERROR_CODE): sensor.sensor_schema(accuracy_decimals=0),
         cv.Required(CONF_PIPE_TEMP_IN): sensor.sensor_schema(),
         cv.Required(CONF_PIPE_TEMP_MID): sensor.sensor_schema(),
         cv.Required(CONF_PIPE_TEMP_OUT): sensor.sensor_schema(),
@@ -97,6 +107,30 @@ CONFIG_SCHEMA = climate.climate_schema(LgController).extend(
             unit_of_measurement=UNIT_KILOWATT,
             accuracy_decimals=3,
             device_class=DEVICE_CLASS_POWER,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ),
+        cv.Optional(CONF_HUMIDITY): sensor.sensor_schema(
+            unit_of_measurement=UNIT_PERCENT,
+            accuracy_decimals=0,
+            device_class=DEVICE_CLASS_HUMIDITY,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ),
+        cv.Optional(CONF_FAN_OPERATION_TIME): sensor.sensor_schema(
+            unit_of_measurement=UNIT_HOUR,
+            accuracy_decimals=0,
+            device_class=DEVICE_CLASS_DURATION,
+            state_class=STATE_CLASS_TOTAL_INCREASING,
+        ),
+        cv.Optional(CONF_INDOOR_UNIT_OPERATION_TIME): sensor.sensor_schema(
+            unit_of_measurement=UNIT_HOUR,
+            accuracy_decimals=0,
+            device_class=DEVICE_CLASS_DURATION,
+            state_class=STATE_CLASS_TOTAL_INCREASING,
+        ),
+        cv.Optional(CONF_PRECISE_ROOM_TEMPERATURE): sensor.sensor_schema(
+            unit_of_measurement=UNIT_CELSIUS,
+            accuracy_decimals=1,
+            device_class=DEVICE_CLASS_TEMPERATURE,
             state_class=STATE_CLASS_MEASUREMENT,
         ),
 
@@ -144,14 +178,17 @@ async def to_code(config):
     pipe_temp_in = await sensor.new_sensor(config[CONF_PIPE_TEMP_IN])
     pipe_temp_mid = await sensor.new_sensor(config[CONF_PIPE_TEMP_MID])
     pipe_temp_out = await sensor.new_sensor(config[CONF_PIPE_TEMP_OUT])
-    if CONF_POWER_CONSUMPTION in config:
-        power_consumption = await sensor.new_sensor(config[CONF_POWER_CONSUMPTION])
-    else:
-        power_consumption = cg.nullptr
-    if CONF_CURRENT_POWER in config:
-        current_power = await sensor.new_sensor(config[CONF_CURRENT_POWER])
-    else:
-        current_power = cg.nullptr
+    optional_sensors = [
+        await sensor.new_sensor(config[key]) if key in config else cg.nullptr
+        for key in (
+            CONF_POWER_CONSUMPTION,
+            CONF_CURRENT_POWER,
+            CONF_HUMIDITY,
+            CONF_FAN_OPERATION_TIME,
+            CONF_INDOOR_UNIT_OPERATION_TIME,
+            CONF_PRECISE_ROOM_TEMPERATURE,
+        )
+    ]
 
     defrost = await binary_sensor.new_binary_sensor(config[CONF_DEFROST])
     preheat = await binary_sensor.new_binary_sensor(config[CONF_PREHEAT])
@@ -167,7 +204,7 @@ async def to_code(config):
                            fan_speed_slow, fan_speed_low, fan_speed_medium, fan_speed_high,
                            sleep_timer,
                            error_code, pipe_temp_in, pipe_temp_mid, pipe_temp_out,
-                           power_consumption, current_power,
+                           *optional_sensors,
                            defrost, preheat, outdoor, auto_dry_active,
                            purifier, internal_thermistor, auto_dry,
                            config[CONF_FAHRENHEIT], config[CONF_IS_SLAVE_CONTROLLER])

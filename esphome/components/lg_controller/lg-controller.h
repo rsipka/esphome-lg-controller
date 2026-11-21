@@ -160,6 +160,10 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     esphome::sensor::Sensor& pipe_temp_out_;
     esphome::sensor::Sensor* power_consumption_;
     esphome::sensor::Sensor* current_power_;
+    esphome::sensor::Sensor* humidity_;
+    esphome::sensor::Sensor* fan_operation_time_;
+    esphome::sensor::Sensor* indoor_unit_operation_time_;
+    esphome::sensor::Sensor* precise_room_temperature_;
     esphome::binary_sensor::BinarySensor& defrost_;
     esphome::binary_sensor::BinarySensor& preheat_;
     esphome::binary_sensor::BinarySensor& outdoor_;
@@ -290,7 +294,8 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
         supported_traits_.set_supported_modes(device_modes);
         supported_traits_.set_supported_fan_modes(fan_modes);
         supported_traits_.set_supported_swing_modes(swing_modes);
-        supported_traits_.add_feature_flags(climate::CLIMATE_SUPPORTS_CURRENT_TEMPERATURE);
+        supported_traits_.add_feature_flags(climate::CLIMATE_SUPPORTS_CURRENT_TEMPERATURE |
+                                            climate::CLIMATE_SUPPORTS_ACTION);
         supported_traits_.set_visual_min_temperature(MIN_TEMP_SETPOINT);
         supported_traits_.set_visual_max_temperature(MAX_TEMP_SETPOINT);
         supported_traits_.set_visual_current_temperature_step(fahrenheit_ ? 1 : 0.5);
@@ -356,6 +361,10 @@ public:
                  sensor::Sensor* pipe_temp_out,
                  sensor::Sensor* power_consumption,
                  sensor::Sensor* current_power,
+                 sensor::Sensor* humidity,
+                 sensor::Sensor* fan_operation_time,
+                 sensor::Sensor* indoor_unit_operation_time,
+                 sensor::Sensor* precise_room_temperature,
                  binary_sensor::BinarySensor* defrost,
                  binary_sensor::BinarySensor* preheat,
                  binary_sensor::BinarySensor* outdoor,
@@ -382,6 +391,10 @@ public:
         pipe_temp_out_(*pipe_temp_out),
         power_consumption_(power_consumption),
         current_power_(current_power),
+        humidity_(humidity),
+        fan_operation_time_(fan_operation_time),
+        indoor_unit_operation_time_(indoor_unit_operation_time),
+        precise_room_temperature_(precise_room_temperature),
         defrost_(*defrost),
         preheat_(*preheat),
         outdoor_(*outdoor),
@@ -497,6 +510,54 @@ public:
     }
 
 private:
+    static optional<climate::ClimateMode> decode_status_mode(uint8_t status) {
+        if ((status & 0x02) == 0) {
+            return climate::CLIMATE_MODE_OFF;
+        }
+        switch ((status >> 2) & 0x07) {
+            case 0: return climate::CLIMATE_MODE_COOL;
+            case 1: return climate::CLIMATE_MODE_DRY;
+            case 2: return climate::CLIMATE_MODE_FAN_ONLY;
+            case 3: return climate::CLIMATE_MODE_HEAT_COOL;
+            case 4: return climate::CLIMATE_MODE_HEAT;
+            default: return {};
+        }
+    }
+
+    static climate::ClimateAction action_from_status(climate::ClimateMode reported_mode,
+                                                     const uint8_t* buffer) {
+        if (reported_mode == climate::CLIMATE_MODE_OFF) {
+            return climate::CLIMATE_ACTION_OFF;
+        }
+        if (buffer[3] & 0x04) {
+            return climate::CLIMATE_ACTION_DEFROSTING;
+        }
+        if (reported_mode == climate::CLIMATE_MODE_FAN_ONLY) {
+            return climate::CLIMATE_ACTION_FAN;
+        }
+        if (!(buffer[5] & 0x04) || (buffer[3] & 0x08)) {
+            return climate::CLIMATE_ACTION_IDLE;
+        }
+        switch (reported_mode) {
+            case climate::CLIMATE_MODE_COOL:
+                return climate::CLIMATE_ACTION_COOLING;
+            case climate::CLIMATE_MODE_DRY:
+                return climate::CLIMATE_ACTION_DRYING;
+            case climate::CLIMATE_MODE_HEAT:
+                return climate::CLIMATE_ACTION_HEATING;
+            case climate::CLIMATE_MODE_HEAT_COOL:
+                if ((buffer[7] & 0xC0) == 0x40) {
+                    return climate::CLIMATE_ACTION_COOLING;
+                }
+                if ((buffer[7] & 0xC0) == 0x80) {
+                    return climate::CLIMATE_ACTION_HEATING;
+                }
+                return climate::CLIMATE_ACTION_IDLE;
+            default:
+                return climate::CLIMATE_ACTION_IDLE;
+        }
+    }
+
     // Sets position of vane index (1-4) to position (0-6).
     void set_vane_position(int index, int position) {
         if (index < 1 || index > 4) {
@@ -949,6 +1010,9 @@ private:
             case 4: // 0xCC/AC/2C
                 process_type_c_status_message(*sender, buffer);
                 break;
+            case 6: // 0xCE/AE/2E
+                process_type_e_status_message(*sender, buffer);
+                break;
             case 7: // 0xCF/AF/2F
                 process_type_f_status_message(*sender, buffer);
                 break;
@@ -1011,6 +1075,7 @@ private:
             // others always send the internal temperature.
             read_temp = (sender == MessageSender::Unit && internal_thermistor_.state);
         }
+        bool climate_changed = false;
         if (read_temp) {
             float room_temp = float(buffer[7] & 0x3F) / 2 + 10;
             if (fahrenheit_) {
@@ -1018,18 +1083,28 @@ private:
             }
             if (this->current_temperature != room_temp) {
                 this->current_temperature = room_temp;
-                publish_state();
+                climate_changed = true;
+            }
+        }
+
+        uint8_t b = buffer[1];
+        auto reported_mode = decode_status_mode(b);
+        // The unit reports its live action even while a local setting change is pending.
+        if (sender == MessageSender::Unit && reported_mode.has_value()) {
+            auto reported_action = action_from_status(*reported_mode, buffer);
+            if (this->action != reported_action) {
+                this->action = reported_action;
+                climate_changed = true;
             }
         }
 
         // Don't update our settings if we have a pending change/send, because else we overwrite
         // changes we still have to send (or are sending) to the AC.
-        if (pending_status_change_) {
-            ESP_LOGD(TAG, "ignoring because pending change");
-            return;
-        }
-        if (pending_send_ == PendingSendKind::Status) {
-            ESP_LOGD(TAG, "ignoring because pending send");
+        if (pending_status_change_ || pending_send_ == PendingSendKind::Status) {
+            ESP_LOGD(TAG, "ignoring status settings while a change is pending");
+            if (climate_changed) {
+                publish_state();
+            }
             return;
         }
 
@@ -1037,33 +1112,15 @@ private:
             memcpy(last_recv_status_, buffer, MsgLen);
         }
 
-        uint8_t b = buffer[1];
-        if ((b & 0x2) == 0) {
-            this->mode = climate::CLIMATE_MODE_OFF;
-        } else {
-            uint8_t mode_val = (b >> 2) & 0b111;
-            switch (mode_val) {
-                case 0:
-                    this->mode = climate::CLIMATE_MODE_COOL;
-                    break;
-                case 1:
-                    this->mode = climate::CLIMATE_MODE_DRY;
-                    break;
-                case 2:
-                    this->mode = climate::CLIMATE_MODE_FAN_ONLY;
-                    break;
-                case 3:
-                    this->mode = climate::CLIMATE_MODE_HEAT_COOL;
-                    break;
-                case 4:
-                    this->mode = climate::CLIMATE_MODE_HEAT;
-                    break;
-                default:
-                    ESP_LOGE(TAG, "received invalid operation mode from AC (%u)", mode_val);
-                    *had_error = true;
-                    return;
+        if (!reported_mode.has_value()) {
+            ESP_LOGE(TAG, "received invalid operation mode from AC (%u)", (b >> 2) & 0x07);
+            *had_error = true;
+            if (climate_changed) {
+                publish_state();
             }
+            return;
         }
+        this->mode = *reported_mode;
 
         uint8_t fan_val = b >> 5;
         switch (fan_val) {
@@ -1085,6 +1142,9 @@ private:
             default:
                 ESP_LOGE(TAG, "received unexpected fan mode from AC (%u)", fan_val);
                 *had_error = true;
+                if (climate_changed) {
+                    publish_state();
+                }
                 return;
         }
 
@@ -1297,6 +1357,25 @@ private:
     void process_type_c_status_message(MessageSender sender, const uint8_t* buffer) {
         if (sender == MessageSender::Unit && power_consumption_ != nullptr) {
             power_consumption_->publish_state(decode_uint24_be(buffer + 3) / 10.0f);
+        }
+    }
+
+    void process_type_e_status_message(MessageSender sender, const uint8_t* buffer) {
+        if (sender == MessageSender::Slave || buffer[1] != 0x80) {
+            return;
+        }
+
+        if (humidity_ != nullptr && buffer[2] <= 100) {
+            humidity_->publish_state(buffer[2]);
+        }
+        if (fan_operation_time_ != nullptr) {
+            fan_operation_time_->publish_state(encode_uint16(buffer[3], buffer[4]));
+        }
+        if (indoor_unit_operation_time_ != nullptr) {
+            indoor_unit_operation_time_->publish_state(encode_uint16(buffer[6], buffer[7]));
+        }
+        if (precise_room_temperature_ != nullptr && buffer[11] <= 9) {
+            precise_room_temperature_->publish_state(buffer[10] + buffer[11] / 10.0f);
         }
     }
 
