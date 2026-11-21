@@ -200,6 +200,7 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     PendingSendKind pending_send_ = PendingSendKind::None;
 
     bool pending_status_change_ = false;
+    bool pending_status_refresh_ = false;
     bool pending_type_a_settings_change_ = false;
     bool pending_type_b_settings_change_ = false;
     bool pending_type_b_request_ = false;
@@ -254,6 +255,10 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
         uint8_t capabilities_message[13] = {};
     };
     NVSStorage nvs_storage_;
+    NVSStorage active_capabilities_;
+    ESPPreferenceObject intermediate_fan_preference_;
+    uint8_t saved_intermediate_fan_speed_ = 0;
+    static constexpr uint32_t INTERMEDIATE_FAN_PREFERENCE_KEY = 2589760981U;
 
     const bool fahrenheit_;
 
@@ -281,42 +286,44 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     };
 
     bool parse_capability(LgCapability capability) {
+        const uint8_t* capabilities = active_capabilities_.capabilities_message;
         switch (capability) {
             case LgCapability::FAN_AUTO:
-                return (nvs_storage_.capabilities_message[3] & 0x01) != 0;
+                return (capabilities[3] & 0x01) != 0;
             case LgCapability::FAN_SLOW:
-                return (nvs_storage_.capabilities_message[3] & 0x20) != 0;
+                return (capabilities[3] & 0x20) != 0;
             case LgCapability::FAN_LOW:
-                return (nvs_storage_.capabilities_message[3] & 0x10) != 0;
+                return (capabilities[3] & 0x10) != 0;
             case LgCapability::FAN_LOW_MEDIUM:
-                return (nvs_storage_.capabilities_message[6] & 0x08) != 0;
+                return (capabilities[6] & 0x08) != 0;
             case LgCapability::FAN_MEDIUM:
-                return (nvs_storage_.capabilities_message[3] & 0x08) != 0;
+                return (capabilities[3] & 0x08) != 0;
             case LgCapability::FAN_MEDIUM_HIGH:
-                return (nvs_storage_.capabilities_message[6] & 0x10) != 0;
+                return (capabilities[6] & 0x10) != 0;
             case LgCapability::FAN_HIGH:
                 return true;
             case LgCapability::FAN_POWER:
-                return (nvs_storage_.capabilities_message[3] & 0x02) != 0;
+                return (capabilities[3] & 0x02) != 0;
             case LgCapability::WHOLE_DEGREE_SETPOINT:
-                return (nvs_storage_.capabilities_message[5] & 0x20) != 0;
+                return (capabilities[5] & 0x20) != 0;
             case LgCapability::MODE_HEATING:
-                return (nvs_storage_.capabilities_message[2] & 0x20) != 0;
+                return (capabilities[2] & 0x20) != 0;
             case LgCapability::MODE_FAN:
-                return (nvs_storage_.capabilities_message[2] & 0x40) != 0;
+                return (capabilities[2] & 0x40) != 0;
             case LgCapability::MODE_AUTO:
-                return (nvs_storage_.capabilities_message[2] & 0x08) != 0;
+                return (capabilities[2] & 0x08) != 0;
             case LgCapability::MODE_DEHUMIDIFY:
-                return (nvs_storage_.capabilities_message[2] & 0x80) != 0;
+                return (capabilities[2] & 0x80) != 0;
             case LgCapability::VERTICAL_SWING:
-                return (nvs_storage_.capabilities_message[1] & 0x80) != 0;
+                return (capabilities[1] & 0x80) != 0;
             case LgCapability::HORIZONTAL_SWING:
-                return (nvs_storage_.capabilities_message[1] & 0x40) != 0;
+                return (capabilities[1] & 0x40) != 0;
         }
         return false;
     }
 
     void configure_capabilities() {
+        active_capabilities_ = nvs_storage_;
         // Default traits
         climate::ClimateModeMask device_modes;
         device_modes.insert(climate::CLIMATE_MODE_OFF);
@@ -351,7 +358,7 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
             fahrenheit_ || parse_capability(LgCapability::WHOLE_DEGREE_SETPOINT) ? 1 : 0.5);
 
         // Only override defaults if the capabilities are known
-        if (nvs_storage_.capabilities_message[0] != 0) {
+        if (active_capabilities_.capabilities_message[0] != 0) {
             // Configure the climate traits
             climate::ClimateModeMask override_device_modes;
             override_device_modes.insert(climate::CLIMATE_MODE_OFF);
@@ -525,9 +532,19 @@ public:
 
         // ESPHome restores fan and swing modes only if the traits already advertise them.
         configure_capabilities();
+        intermediate_fan_preference_ = global_preferences->make_preference<uint8_t>(
+            this->get_object_id_hash() ^ INTERMEDIATE_FAN_PREFERENCE_KEY);
+        intermediate_fan_preference_.load(&saved_intermediate_fan_speed_);
+        this->add_on_state_callback([this](climate::Climate&) {
+            uint8_t speed = get_custom_fan_speed();
+            if (speed != saved_intermediate_fan_speed_ && intermediate_fan_preference_.save(&speed)) {
+                saved_intermediate_fan_speed_ = speed;
+            }
+        });
 
         auto restore = this->restore_state_();
         if (restore.has_value()) {
+            remap_restored_fan_mode(*restore);
             restore->apply(this);
         } else {
             this->mode = climate::CLIMATE_MODE_OFF;
@@ -592,6 +609,38 @@ public:
     }
 
 private:
+    uint8_t get_custom_fan_speed() const {
+        if (!this->has_custom_fan_mode()) {
+            return 0;
+        }
+        return this->get_custom_fan_mode() == FAN_MODE_LOW_MEDIUM
+                   ? FAN_LOW_MEDIUM_SPEED : FAN_MEDIUM_HIGH_SPEED;
+    }
+
+    void remap_restored_fan_mode(climate::ClimateDeviceRestoreState& restore) {
+        if (!restore.uses_custom_fan_mode) {
+            return;
+        }
+
+        uint8_t speed = saved_intermediate_fan_speed_;
+        // Older firmware saved only the list index. Index 1 always meant Medium-High.
+        // Index 0 is ambiguous if the advertised modes have changed.
+        if (speed == 0 && restore.custom_fan_mode == 1) {
+            speed = FAN_MEDIUM_HIGH_SPEED;
+        }
+        bool low_medium = parse_capability(LgCapability::FAN_LOW_MEDIUM);
+        bool medium_high = parse_capability(LgCapability::FAN_MEDIUM_HIGH);
+        if (speed == FAN_LOW_MEDIUM_SPEED && low_medium) {
+            restore.custom_fan_mode = 0;
+        } else if (speed == FAN_MEDIUM_HIGH_SPEED && medium_high) {
+            restore.custom_fan_mode = low_medium ? 1 : 0;
+        } else {
+            restore.uses_custom_fan_mode = false;
+            restore.fan_mode = supported_traits_.supports_fan_mode(climate::CLIMATE_FAN_MEDIUM)
+                                   ? climate::CLIMATE_FAN_MEDIUM : climate::CLIMATE_FAN_HIGH;
+        }
+    }
+
     void queue_status_change(uint8_t fields) {
         if (slave_ && !slave_status_synced_) {
             startup_status_fields_ |= fields;
@@ -929,11 +978,8 @@ private:
                 break;
         }
         
-        uint8_t intermediate_speed = intermediate_fan_speed_;
-        if (this->has_custom_fan_mode()) {
-            intermediate_speed = this->get_custom_fan_mode() == FAN_MODE_LOW_MEDIUM
-                                     ? FAN_LOW_MEDIUM_SPEED : FAN_MEDIUM_HIGH_SPEED;
-        }
+        uint8_t custom_fan_speed = get_custom_fan_speed();
+        uint8_t intermediate_speed = custom_fan_speed != 0 ? custom_fan_speed : intermediate_fan_speed_;
         if (intermediate_speed != 0) {
             b |= intermediate_speed << 5;
         } else if (this->fan_mode.has_value()) {
@@ -1081,6 +1127,7 @@ private:
         UARTDevice::write_array(send_buf_, MsgLen);
 
         pending_status_change_ = false;
+        pending_status_refresh_ = false;
         pending_send_ = PendingSendKind::Status;
         last_sent_status_millis_ = millis();
 
@@ -1377,7 +1424,8 @@ private:
 
         // Don't update our settings if we have a pending change/send, because else we overwrite
         // changes we still have to send (or are sending) to the AC.
-        if (!syncing_slave && (pending_status_change_ || pending_send_ == PendingSendKind::Status)) {
+        bool awaiting_status_change = pending_send_ == PendingSendKind::Status && (send_buf_[1] & 0x01);
+        if (!syncing_slave && (pending_status_change_ || awaiting_status_change)) {
             ESP_LOGV(TAG, "Ignoring status settings while a change is pending");
             if (climate_changed) {
                 publish_state();
@@ -1482,8 +1530,11 @@ private:
             ESPPreferenceObject pref = global_preferences->make_preference<NVSStorage>(this->get_object_id_hash() ^ NVS_STORAGE_VERSION);
             if (pref.save(&updated) && global_preferences->sync()) {
                 nvs_storage_ = updated;
-                // Avoid interrupting a sleep timer to apply newly discovered capabilities.
-                if (first_capabilities && !sleep_timer_command_pending_ && !sleep_timer_cancel_pending_ &&
+                // Apply new traits automatically only during initial synchronization without queued commands.
+                if (first_capabilities && is_initializing_ &&
+                    pending_type_a_fields_ == 0 && sent_type_a_fields_ == 0 && awaiting_type_a_fields_ == 0 &&
+                    !overheating_change_pending_ && !overheating_change_sent_ &&
+                    !sleep_timer_command_pending_ && !sleep_timer_cancel_pending_ &&
                     !sleep_timer_target_millis_.has_value()) {
                     ESP_LOGD(TAG, "restarting to apply initial capabilities");
                     App.safe_reboot();
@@ -1681,9 +1732,13 @@ private:
             ESP_LOGW(TAG, "Missing transmit echo for frame 0x%02X; retrying", unsigned(send_buf_[0]));
             switch (pending_send_) {
                 case PendingSendKind::Status:
-                    pending_status_change_ = true;
-                    if (((send_buf_[8] >> 3) & 0x7) == SLEEP_TIMER_KIND && sleep_timer_start_millis_.has_value()) {
-                        sleep_timer_command_pending_ = true;
+                    if (send_buf_[1] & 0x01) {
+                        pending_status_change_ = true;
+                        if (((send_buf_[8] >> 3) & 0x7) == SLEEP_TIMER_KIND && sleep_timer_start_millis_.has_value()) {
+                            sleep_timer_command_pending_ = true;
+                        }
+                    } else {
+                        pending_status_refresh_ = true;
                     }
                     break;
                 case PendingSendKind::TypeA:
@@ -1768,7 +1823,8 @@ private:
                           (last_recv_type_a_settings_[0] == 0xCA || last_recv_type_a_settings_[0] == 0xAA);
         bool type_b_due = pending_type_b_settings_change_ && last_recv_type_b_settings_[0] != 0;
         bool status_change_due = pending_status_change_ || (!is_initializing_ && sleep_timer_command_pending_);
-        bool status_due = status_change_due || (!slave_ && millis_now - last_sent_status_millis_ > 20 * 1000);
+        bool status_due = status_change_due ||
+                          (!slave_ && (pending_status_refresh_ || millis_now - last_sent_status_millis_ > 20 * 1000));
         // Alternate status and settings when both are queued, including settings retries.
         if (status_due && (prefer_status_send_ || (!type_a_due && !type_b_due))) {
             if (check_can_send()) {
