@@ -100,11 +100,11 @@ private:
 public:
     // Convert from Fahrenheit to LG-Celsius (using the LG-compatible conversion).
     static float fahrenheit_to_lgcelsius(float temp) {
-        int temp_int = int(round(temp));
-        if (temp_int < 32 || temp_int > 104) {
+        float rounded = round(temp);
+        if (!std::isfinite(rounded) || rounded < 32 || rounded > 104) {
             return esphome::fahrenheit_to_celsius(temp);
         }
-        int8_t val = FahToLGCel[temp_int - 32];
+        int8_t val = FahToLGCel[int(rounded) - 32];
         return float(val / 2) + ((val & 1) ? 0.5f : 0.0f);
     }
     // Convert an LG-Celsius value to Celsius. This is done to ensure the LG unit and HA agree
@@ -209,7 +209,10 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     static constexpr uint16_t TYPE_A_AUTO_DRY = 1U << 8;
     uint16_t pending_type_a_fields_ = 0;
     uint16_t sent_type_a_fields_ = 0;
+    uint16_t awaiting_type_a_fields_ = 0;
+    uint32_t type_a_echo_millis_ = 0;
     bool publishing_type_a_settings_ = false;
+    static constexpr uint32_t SETTINGS_READBACK_TIMEOUT_MS = 15000;
 
     bool is_initializing_ = true;
     bool slave_status_synced_ = false;
@@ -228,6 +231,7 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     uint8_t overheating_ = 0;
 
     optional<uint32_t> sleep_timer_target_millis_{};
+    optional<uint32_t> sleep_timer_start_millis_{};
     optional<uint32_t> last_peer_sleep_command_minutes_{};
     static constexpr uint8_t SLEEP_TIMER_KIND = 3;
     bool sleep_timer_cancel_pending_ = false;
@@ -494,6 +498,7 @@ public:
     }
 
     void setup() override {
+        ESP_LOGD(TAG, "Starting LG controller in %s mode", slave_ ? "slave" : "master");
         // Load our custom NVS storage to get the capabilities message
         ESPPreferenceObject pref = global_preferences->make_preference<NVSStorage>(this->get_object_id_hash() ^ NVS_STORAGE_VERSION);
         pref.load(&nvs_storage_);
@@ -552,6 +557,7 @@ public:
             fields |= STARTUP_SWING;
         }
         queue_status_change(fields);
+        ESP_LOGD(TAG, "Queued climate command");
         this->publish_state();
     }
 
@@ -573,7 +579,16 @@ private:
     }
 
     bool is_type_a_field_pending(uint16_t field) const {
-        return ((pending_type_a_fields_ | sent_type_a_fields_) & field) != 0;
+        return ((pending_type_a_fields_ | sent_type_a_fields_ | awaiting_type_a_fields_) & field) != 0;
+    }
+
+    void confirm_type_a_field(uint16_t field, bool matches) {
+        if (matches && (awaiting_type_a_fields_ & field) != 0) {
+            awaiting_type_a_fields_ &= ~field;
+            if (awaiting_type_a_fields_ == 0) {
+                ESP_LOGD(TAG, "Unit confirmed Type A settings");
+            }
+        }
     }
 
     static optional<climate::ClimateMode> decode_status_mode(uint8_t status) {
@@ -701,6 +716,10 @@ private:
         }
         ESP_LOGD(TAG, "Setting sleep timer: %d minutes", minutes);
         sleep_timer_cancel_pending_ = minutes == 0;
+        sleep_timer_start_millis_.reset();
+        if (minutes > 0) {
+            sleep_timer_start_millis_ = millis();
+        }
         apply_sleep_timer(minutes);
         return true;
     }
@@ -732,7 +751,7 @@ private:
         }
 
         float temp = temperature_sensor_->get_state();
-        if (std::isnan(temp) || temp == 0) {
+        if (!std::isfinite(temp) || temp == 0) {
             return {};
         }
         if (fahrenheit_) {
@@ -763,9 +782,28 @@ private:
         bool reservation_active = buffer[3] & 0x10;
         uint8_t kind = (buffer[8] >> 3) & 0x7;
         uint32_t minutes = (uint32_t(buffer[8] & 0x7) << 8) | buffer[9];
+        bool peer_timer_command = (slave_ ? sender == MessageSender::Master : sender == MessageSender::Slave) &&
+                                  (buffer[1] & 0x01) && kind == SLEEP_TIMER_KIND && minutes <= 7 * 60;
+        bool new_peer_command = peer_timer_command && last_peer_sleep_command_minutes_ != minutes;
+        if (sleep_timer_start_millis_.has_value()) {
+            bool matching_report = kind == SLEEP_TIMER_KIND && minutes > 0 &&
+                                   get_sleep_timer_minutes() == minutes;
+            if (!matching_report && !new_peer_command &&
+                millis() - *sleep_timer_start_millis_ < SETTINGS_READBACK_TIMEOUT_MS) {
+                ESP_LOGV(TAG, "Ignoring timer report while waiting for start confirmation");
+                return;
+            }
+            sleep_timer_start_millis_.reset();
+            if (matching_report) {
+                ESP_LOGD(TAG, "Bus confirmed sleep timer start");
+            }
+        }
         bool sleep_timer_cleared = (kind == SLEEP_TIMER_KIND && minutes == 0) ||
                                    (kind != SLEEP_TIMER_KIND && !reservation_active) || kind == 4;
         if (sleep_timer_cleared) {
+            if (sleep_timer_cancel_pending_) {
+                ESP_LOGD(TAG, "Bus confirmed sleep timer cancellation");
+            }
             sleep_timer_cancel_pending_ = false;
             last_peer_sleep_command_minutes_.reset();
             apply_sleep_timer(0);
@@ -775,8 +813,19 @@ private:
             return;
         }
         // A send echo alone does not confirm the unit has cleared its timer.
-        if (sleep_timer_cancel_pending_) {
+        if (sleep_timer_cancel_pending_ && !new_peer_command) {
+            if (kind != SLEEP_TIMER_KIND && reservation_active) {
+                active_reservation_ = true;
+            }
+            ESP_LOGV(TAG, "Ignoring timer report while waiting for cancellation confirmation");
             return;
+        }
+        if (new_peer_command) {
+            last_peer_sleep_command_minutes_ = minutes;
+            if (sleep_timer_cancel_pending_) {
+                ESP_LOGD(TAG, "New wired-controller timer superseded local cancellation");
+                sleep_timer_cancel_pending_ = false;
+            }
         }
         active_reservation_ = reservation_active;
         if (kind != SLEEP_TIMER_KIND || minutes > 7 * 60) {
@@ -785,11 +834,6 @@ private:
         if (!slave_) {
             // Unit reports can shorten a countdown. A new command from another controller can
             // also extend it. Repeated copies of that command are treated as reports.
-            bool new_peer_command = sender == MessageSender::Slave && (buffer[1] & 0x01) &&
-                                    last_peer_sleep_command_minutes_ != minutes;
-            if (new_peer_command) {
-                last_peer_sleep_command_minutes_ = minutes;
-            }
             if (!sleep_timer_target_millis_.has_value() || new_peer_command) {
                 apply_sleep_timer(minutes);
             } else {
@@ -981,6 +1025,9 @@ private:
             send_buf_[8] = SLEEP_TIMER_KIND << 3;
             send_buf_[8] |= (*minutes >> 8) & 0b111;
             send_buf_[9] = *minutes & 0xff;
+            if (pending_status_change_ && sleep_timer_start_millis_.has_value()) {
+                sleep_timer_start_millis_ = millis();
+            }
         }
 
         // Byte 11.
@@ -989,7 +1036,10 @@ private:
         // Byte 12.
         send_buf_[12] = calc_checksum(send_buf_);
 
-        ESP_LOGD(TAG, "sending %s", format_hex_pretty(send_buf_, MsgLen).c_str());
+        if (pending_status_change_) {
+            ESP_LOGD(TAG, "Sending status change");
+        }
+        ESP_LOGV(TAG, "TX %s", format_hex_pretty(send_buf_, MsgLen).c_str());
         UARTDevice::write_array(send_buf_, MsgLen);
 
         pending_status_change_ = false;
@@ -1036,7 +1086,8 @@ private:
 
         send_buf_[12] = calc_checksum(send_buf_);
 
-        ESP_LOGD(TAG, "sending %s", format_hex_pretty(send_buf_, MsgLen).c_str());
+        ESP_LOGD(TAG, "Sending Type A settings");
+        ESP_LOGV(TAG, "TX %s", format_hex_pretty(send_buf_, MsgLen).c_str());
         UARTDevice::write_array(send_buf_, MsgLen);
 
         pending_type_a_settings_change_ = false;
@@ -1046,9 +1097,6 @@ private:
     }
 
     void send_type_b_settings_message(bool timed) {
-        if (timed) {
-            ESP_LOGD(TAG, "sending timed AB message");
-        }
         if (last_recv_type_b_settings_[0] != 0xCB && last_recv_type_b_settings_[0] != 0xAB) {
             ESP_LOGE(TAG, "Unexpected missing previous CB/AB message");
             // Don't try to send another message immediately after.
@@ -1071,7 +1119,8 @@ private:
 
         send_buf_[12] = calc_checksum(send_buf_);
 
-        ESP_LOGD(TAG, "sending %s", format_hex_pretty(send_buf_, MsgLen).c_str());
+        ESP_LOGD(TAG, "Sending Type B %s", timed ? "telemetry request" : "settings");
+        ESP_LOGV(TAG, "TX %s", format_hex_pretty(send_buf_, MsgLen).c_str());
         UARTDevice::write_array(send_buf_, MsgLen);
 
         if (timed) {
@@ -1139,11 +1188,16 @@ private:
     }
 
     void process_message(const uint8_t* buffer) {
-        ESP_LOGD(TAG, "received %s", format_hex_pretty(buffer, MsgLen).c_str());
+        ESP_LOGV(TAG, "RX %s", format_hex_pretty(buffer, MsgLen).c_str());
 
         if (pending_send_ != PendingSendKind::None && memcmp(send_buf_, buffer, MsgLen) == 0) {
-            ESP_LOGD(TAG, "verified send");
+            ESP_LOGV(TAG, "Received transmit echo");
             if (pending_send_ == PendingSendKind::TypeA) {
+                if (sent_type_a_fields_ != 0) {
+                    awaiting_type_a_fields_ |= sent_type_a_fields_;
+                    type_a_echo_millis_ = millis();
+                    ESP_LOGD(TAG, "Type A transmit echoed, waiting for unit readback");
+                }
                 sent_type_a_fields_ = 0;
             } else if (pending_send_ == PendingSendKind::TypeB) {
                 overheating_change_sent_ = false;
@@ -1276,7 +1330,7 @@ private:
         // Don't update our settings if we have a pending change/send, because else we overwrite
         // changes we still have to send (or are sending) to the AC.
         if (!syncing_slave && (pending_status_change_ || pending_send_ == PendingSendKind::Status)) {
-            ESP_LOGD(TAG, "ignoring status settings while a change is pending");
+            ESP_LOGV(TAG, "Ignoring status settings while a change is pending");
             if (climate_changed) {
                 publish_state();
             }
@@ -1347,6 +1401,7 @@ private:
             slave_status_synced_ = true;
             is_initializing_ = false;
             startup_status_fields_ = 0;
+            ESP_LOGD(TAG, "Slave synchronized with LG bus");
         }
 
         publish_state();
@@ -1399,10 +1454,14 @@ private:
         publishing_type_a_settings_ = true;
         LgSelect* const vanes[] = {&vane_select_1_, &vane_select_2_, &vane_select_3_, &vane_select_4_};
         for (size_t i = 0; i < 4; ++i) {
-            if (is_type_a_field_pending(1U << i)) {
+            uint16_t field = 1U << i;
+            uint8_t position = (buffer[7 + i / 2] >> ((i % 2) * 4)) & 0x0F;
+            if (sender == MessageSender::Unit) {
+                confirm_type_a_field(field, position == vane_position_[i]);
+            }
+            if (is_type_a_field_pending(field)) {
                 continue;
             }
-            uint8_t position = (buffer[7 + i / 2] >> ((i % 2) * 4)) & 0x0F;
             if (position <= 6) {
                 vane_position_[i] = position;
                 vanes[i]->publish_state(*vanes[i]->at(position));
@@ -1411,15 +1470,24 @@ private:
             }
         }
 
+        bool auto_dry = buffer[11] & 0x8;
+        if (sender == MessageSender::Unit) {
+            confirm_type_a_field(TYPE_A_AUTO_DRY, auto_dry == auto_dry_.state);
+        }
         if (!is_type_a_field_pending(TYPE_A_AUTO_DRY)) {
-            publish_switch_state(auto_dry_, buffer[11] & 0x8);
+            publish_switch_state(auto_dry_, auto_dry);
         }
 
         if (sender != MessageSender::Slave) {
             LgNumber* const speeds[] = {&fan_speed_slow_, &fan_speed_low_, &fan_speed_medium_, &fan_speed_high_};
             for (size_t i = 0; i < 4; ++i) {
-                if (!is_type_a_field_pending(1U << (i + 4))) {
-                    fan_speed_[i] = buffer[2 + i];
+                uint16_t field = 1U << (i + 4);
+                uint8_t speed = buffer[2 + i];
+                if (sender == MessageSender::Unit) {
+                    confirm_type_a_field(field, speed == fan_speed_[i]);
+                }
+                if (!is_type_a_field_pending(field)) {
+                    fan_speed_[i] = speed;
                     speeds[i]->publish_state(fan_speed_[i]);
                 }
             }
@@ -1532,8 +1600,10 @@ private:
     }
 
     void update() {
-        ESP_LOGD(TAG, "update");
-
+        if (awaiting_type_a_fields_ != 0 && millis() - type_a_echo_millis_ >= SETTINGS_READBACK_TIMEOUT_MS) {
+            ESP_LOGD(TAG, "Timed out waiting for Type A readback (fields 0x%03X)", unsigned(awaiting_type_a_fields_));
+            awaiting_type_a_fields_ = 0;
+        }
         read_received_messages();
 
         // If we did not receive the message we sent last time, try to send it again next time.
@@ -1541,7 +1611,7 @@ private:
         // sending a lot of messages and this introduces a delay.
         if (pending_send_ != PendingSendKind::None &&
             (!is_initializing_ || sent_type_a_fields_ != 0 || overheating_change_sent_)) {
-            ESP_LOGE(TAG, "did not receive message we just sent");
+            ESP_LOGW(TAG, "Missing transmit echo for frame 0x%02X; retrying", unsigned(send_buf_[0]));
             switch (pending_send_) {
                 case PendingSendKind::Status:
                     pending_status_change_ = true;
@@ -1579,6 +1649,7 @@ private:
             if (diff <= 0) {
                 ESP_LOGD(TAG, "Turning off for sleep timer");
                 apply_sleep_timer(0);
+                sleep_timer_start_millis_.reset();
                 sleep_timer_cancel_pending_ = true;
                 publish_sleep_timer(0);
                 this->mode = climate::CLIMATE_MODE_OFF;
@@ -1592,7 +1663,7 @@ private:
         }
 
         if (slave_ && !slave_status_synced_) {
-            ESP_LOGD(TAG, "Not sending, waiting for other controller or unit to send first");
+            ESP_LOGV(TAG, "Waiting for initial slave status");
             return;
         }
 
@@ -1612,7 +1683,7 @@ private:
         auto check_can_send = [&]() -> bool {
             while (true) {
                 if (UARTDevice::available() > 0 || !rx_pin_.digital_read()) {
-                    ESP_LOGD(TAG, "line busy, not sending yet");
+                    ESP_LOGV(TAG, "Bus busy; deferring send");
                     return false;
                 }
                 if (millis() - millis_now > 500) {

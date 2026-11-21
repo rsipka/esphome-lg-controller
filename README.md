@@ -103,6 +103,25 @@ I used the following steps to build the ESPHome firmware, flash it on the device
 
 If you just want to connect to the device to view the debug logs, use `esphome logs lg-livingroom.yaml`.
 
+## Debug the LG bus
+
+The template uses `DEBUG` for command sends, startup synchronization, and timer and settings
+confirmation. Checksum errors and missing transmit echoes are logged at `WARN`.
+To capture raw LG frames and see why the controller deferred a send or ignored a report,
+replace the device's `logger:` block temporarily and rebuild.
+
+```yaml
+logger:
+  level: VERBOSE
+  initial_level: DEBUG
+  logs:
+    lg-controller: VERBOSE
+```
+
+Run `esphome logs lg-livingroom.yaml` and reproduce the issue. For startup issues, start
+capturing before rebooting if you have a serial log connection. Restore `level: DEBUG`
+after the capture to reduce logging overhead.
+
 # Features
 Features currently available in Home Assistant:
 * Operation mode (off, auto, cool, heat, dry/dehumidify, fan only).
