@@ -290,7 +290,7 @@ The wall controller sends these regularly and apparently some AC units do this t
 | 2 | `0000_XXXX` | Filter time left in hours (high bits) |
 |   | `0X00_0000` | Occupancy status |
 |   | `X000_0000` | Dual setpoint mode |
-| 3-5 | `XXXX_XXXX` | Power Consumption in kWh. Example: `64.91.29 => 64912.9 kWh` |
+| 3-5 | `XXXX_XXXX` | Cumulative energy. The firmware decodes this as an unsigned 24-bit big-endian counter in 0.1 kWh steps. |
 | 6 | `0XXX_XXXX` | Setpoint in degrees C, integer part. Used for the high setpoint in dual setpoint mode |
 | 7 | `0XXX_XXXX` | Setpoint in degrees C, integer part. Used for the low setpoint in dual setpoint mode |
 |   | `X000_0000` | Set if settings were changed. This is similar to the bit in byte 1 for Type 0 status messages |
@@ -302,6 +302,11 @@ The wall controller sends these regularly and apparently some AC units do this t
 |    | `0000_00X0` | Mosquito Away |
 |    | `0000_0X00` | Comfort Cooling |
 | 12 | `XXXX_XXXX` | Checksum |
+
+The binary interpretation follows the counter behavior reported in [PR #170](https://github.com/JanM321/esphome-lg-controller/pull/170#discussion_r3705805224).
+For example, `00.02.CF` to `00.02.D0` represents 71.9 to 72.0 kWh.
+An earlier protocol note interpreted `64.91.29` as 64912.9 kWh.
+The encoding and energy reporting accuracy may vary by model.
 
 ## Type 5: Advanced settings (0xAD/0xCD)
 My unit sends this after power on with all zeroes. The wall controller uses it for installer settings.
@@ -346,7 +351,10 @@ AE.80.3C.0F.17.00.2A.74.02.00.12.04.13
 ```
 
 ## Type 7: More status information (0xAF/0xCF)
-Used by newer units and controllers. Contains unit's current power usage among other things. Some examples from PREMTB100:
+Used by newer units and controllers. The firmware reads bytes 2–4 as an unsigned
+24-bit big-endian value in watts. In [a capture checked against ThinQ](https://github.com/JanM321/esphome-lg-controller/pull/170#discussion_r3705619454),
+`CF.02.00.02.29.00.04.52.00.00.00.00.07` gives `0x0229` = 553 W.
+Earlier PREMTB100 examples used a different interpretation:
 ```
 CF.00.12.34.56.00.00.00.00.00.00.00.3E => 123.5 kW
 CF.00.98.76.54.00.00.00.00.00.00.00.64 => 987.7 kW
